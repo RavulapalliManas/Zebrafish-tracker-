@@ -11,121 +11,7 @@ from tkinter import simpledialog
 import pandas as pd
 import multiprocessing as mp
 
-class BoxManager:
-    def __init__(self):
-        self.boxes = [] 
-        self.labels = []
-        self.drawing = False
-        self.current_box_start = None
-        self.current_box_end = None
-        self.selected_box_index = None
-        self.selected_corner_index = None
-        self.moving_box = False
-        self.move_start = None
-
-    def get_near_corner(self, box, point, threshold=10):
-        """Return the index of the corner if point is within threshold; else None."""
-        for i, corner in enumerate(box):
-            if np.hypot(corner[0] - point[0], corner[1] - point[1]) < threshold:
-                return i
-        return None
-
-    def point_in_box(self, point, box):
-        """Return True if the point is inside the polygon defined by the box."""
-        pts = np.array(box, np.int32).reshape((-1, 1, 2))
-        return cv2.pointPolygonTest(pts, point, False) >= 0
-
-    def handle_mouse_event(self, event, x, y, flags, param):
-        point = (x, y)
-        if event == cv2.EVENT_LBUTTONDOWN:
-            for i, box in enumerate(self.boxes):
-                corner_idx = self.get_near_corner(box, point)
-                if corner_idx is not None:
-                    self.selected_box_index = i
-                    self.selected_corner_index = corner_idx
-                    return
-            for i, box in enumerate(self.boxes):
-                if self.point_in_box(point, box):
-                    self.selected_box_index = i
-                    self.moving_box = True
-                    self.move_start = point
-                    return
-            self.drawing = True
-            self.current_box_start = point
-            self.current_box_end = point
-
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if self.drawing:
-                self.current_box_end = point
-            elif self.selected_corner_index is not None and self.selected_box_index is not None:
-                self.boxes[self.selected_box_index][self.selected_corner_index] = point
-            elif self.moving_box and self.selected_box_index is not None and self.move_start is not None:
-                dx = x - self.move_start[0]
-                dy = y - self.move_start[1]
-                self.boxes[self.selected_box_index] = [
-                    (cx + dx, cy + dy) for (cx, cy) in self.boxes[self.selected_box_index]
-                ]
-                self.move_start = point
-
-        elif event == cv2.EVENT_LBUTTONUP:
-            if self.drawing:
-                self.drawing = False
-                x1, y1 = self.current_box_start
-                x2, y2 = self.current_box_end
-                x_min, x_max = min(x1, x2), max(x1, x2)
-                y_min, y_max = min(y1, y2), max(y1, y2)
-                new_box = [(x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max)]
-                self.boxes.append(new_box)
-                self.labels.append(f"Box {len(self.boxes)}")
-                self.current_box_start = None
-                self.current_box_end = None
-            self.selected_box_index = None
-            self.selected_corner_index = None
-            self.moving_box = False
-            self.move_start = None
-
-    def draw_boxes(self, frame):
-        temp_frame = frame.copy()
-        for i, box in enumerate(self.boxes):
-            pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(temp_frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-            if i < len(self.labels):
-                cv2.putText(temp_frame, self.labels[i], (box[0][0], box[0][1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            for corner in box:
-                cv2.circle(temp_frame, corner, radius=5, color=(0, 0, 255), thickness=-1)
-        if self.drawing and self.current_box_start and self.current_box_end:
-            cv2.rectangle(temp_frame, self.current_box_start, self.current_box_end, (255, 0, 0), 2)
-        return temp_frame
-
-    def remove_last_box(self):
-        if self.boxes:
-            self.boxes.pop()
-            self.labels.pop()
-
-    def get_box_data(self):
-        return {label: {"coords": box, "time": 0} for label, box in zip(self.labels, self.boxes)}
-
-    def save_configuration(self, filename):
-        config = {"boxes": self.boxes, "labels": self.labels}
-        with open(filename, 'w') as f:
-            json.dump(config, f)
-
-    def load_configuration(self, filename):
-        with open(filename, 'r') as f:
-            config = json.load(f)
-            self.boxes = config["boxes"]
-            self.labels = config["labels"]
-
-    def handle_key_press(self, key):
-        if key == ord('z'):
-            self.remove_last_box()
-        elif key == ord('r'):
-            self.boxes = []
-            self.labels = []
-        elif key == ord('q'):
-            print("Quit key pressed. Exiting...")
-            sys.exit()  
+from box_manager import BoxManager
 
 def define_boxes(video_path, original_fps=30, slowed_fps=10, config_file=None):
     """
@@ -318,7 +204,7 @@ def handle_key_press(key):
 
 def main():
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Downloads/WIN_20250206_17_25_13_Pro.mp4"
+    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/clips/clip_1.mp4"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
@@ -326,15 +212,35 @@ def main():
     # Create an instance of BoxManager
     box_manager = BoxManager()
 
-    box_data = define_boxes(path)
+    # Prompt user for input method
+    user_choice = input("Would you like to (d)raw boxes or provide (c)oordinates? (d/c): ").strip().lower()
+
+    if user_choice == 'c':
+        # Allow user to input coordinates
+        num_boxes = int(input("Enter the number of boxes you want to define: "))
+        for i in range(num_boxes):
+            print(f"Enter coordinates for Box {i+1} (format: x1,y1 x2,y2 x3,y3 x4,y4):")
+            coords_input = input().strip()
+            try:
+                # Parse the input into a list of tuples
+                coordinates = [tuple(map(int, point.split(','))) for point in coords_input.split()]
+                box_manager.add_box_from_coordinates(coordinates, label=f"User Box {i+1}")
+            except ValueError:
+                print("Invalid input format. Please enter coordinates as x,y pairs separated by spaces.")
+                return
+        box_data = box_manager.get_box_data()
+    else:
+        # Default to drawing boxes
+        box_data = define_boxes(path)
+    
     print("User-defined boxes:", box_data)
 
-    # CSV file setup for logging fish detection coordinates
-    csv_filename = "fish_coordinates.csv"
-    csv_file = open(csv_filename, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
+    # Commenting out CSV file setup for logging fish detection coordinates
+    # csv_filename = "fish_coordinates.csv"
+    # csv_file = open(csv_filename, 'w', newline='')
+    # csv_writer = csv.writer(csv_file)
     # Write header: frame index, contour id, center_x, center_y
-    csv_writer.writerow(["frame", "contour_id", "center_x", "center_y"])
+    # csv_writer.writerow(["frame", "contour_id", "center_x", "center_y"])
 
     # Processing parameters
     frame_skip = 1
@@ -353,9 +259,12 @@ def main():
 
     pbar = tqdm(total=total_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
 
+    # Calculate the maximum number of frames to process (5 minutes)
+    max_frames = int(original_fps * 5 * 60)
+
     while True:
         ret, frame = cap.read()
-        if not ret:
+        if not ret or frame_count >= max_frames:
             break
 
         # Skip frames based on frame_skip
@@ -371,18 +280,18 @@ def main():
         if scale_factor != 0.0:
             contours = [np.round(c / scale_factor).astype(np.int32) for c in contours]
 
-        # Log contour center coordinates to CSV for the current frame using moments
-        for idx, contour in enumerate(contours):
-            if cv2.contourArea(contour) < 10:
-                continue  # Skip tiny contours
-            M = cv2.moments(contour)
-            if M["m00"] != 0:
-                center_x = int(M["m10"] / M["m00"])
-                center_y = int(M["m01"] / M["m00"])
-                csv_writer.writerow([frame_count, idx, center_x, center_y])
-            else:
-                # Handle the case where the contour area is zero
-                csv_writer.writerow([frame_count, idx, 0, 0])
+        # Commenting out logging contour center coordinates to CSV for the current frame using moments
+        # for idx, contour in enumerate(contours):
+        #     if cv2.contourArea(contour) < 10:
+        #         continue  # Skip tiny contours
+        #     M = cv2.moments(contour)
+        #     if M["m00"] != 0:
+        #         center_x = int(M["m10"] / M["m00"])
+        #         center_y = int(M["m01"] / M["m00"])
+        #         csv_writer.writerow([frame_count, idx, center_x, center_y])
+        #     else:
+        #         # Handle the case where the contour area is zero
+        #         csv_writer.writerow([frame_count, idx, 0, 0])
 
         draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, frame_skip=frame_skip)
 
@@ -395,7 +304,7 @@ def main():
 
     pbar.close()
     cap.release()
-    csv_file.close()  # Close the CSV file after processing
+    # csv_file.close()  # Close the CSV file after processing
     cv2.destroyAllWindows()
 
     # Update box_data with time spent information
