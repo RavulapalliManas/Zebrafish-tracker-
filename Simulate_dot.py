@@ -59,7 +59,7 @@ def create_moving_dot_animation(csv_path, output_path, frame_size=(1920, 1080),
 
 def main():
     # Example usage
-    csv_path = "detection_log.csv"  # CSV file with frame, x, y. Ensure headers are as expected.
+    csv_path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/fish_coordinates.csv"  # CSV file with frame, x, y. Ensure headers are as expected.
     output_path = "dot_animation.mp4"  # Output video file.
     
     create_moving_dot_animation(

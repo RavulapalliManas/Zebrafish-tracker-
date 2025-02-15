@@ -230,26 +230,23 @@ def detect_fish(enhanced, fgbg, min_contour_area=10):
     Detect fish in the given frame using background subtraction and contour detection.
     """
     fg_mask = fgbg.apply(enhanced)
+    
+    # Define a kernel for morphological operations
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    
+    # Apply erosion to remove noise
     eroded_mask = cv2.erode(fg_mask, kernel, iterations=1)
+    
+    # Apply dilation to close gaps
     dilated_mask = cv2.dilate(eroded_mask, kernel, iterations=1)
+    
+    # Use the cleaned mask for contour detection
     contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
     return [c for c in contours if cv2.contourArea(c) > min_contour_area]
 
 def process_frame(frame, fgbg, clahe, brightness_increase, scale_factor):
-    """
-    Enhance the frame and detect fish contours.
-    """
-    # Convert to grayscale and apply CLAHE
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    enhanced = clahe.apply(gray)
-    enhanced = cv2.convertScaleAbs(enhanced, alpha=1, beta=brightness_increase)
-
-    # Resize frame for faster processing
-    if scale_factor != 1.0:
-        enhanced = cv2.resize(enhanced, None, fx=scale_factor, fy=scale_factor)
-
-    # Detect fish
+    enhanced, _ = preprocess_frame(frame, brightness_increase, clahe, scale_factor)
     contours = detect_fish(enhanced, fgbg)
     return enhanced, contours
 
@@ -270,18 +267,41 @@ def is_contour_in_box(contour, box):
     cx, cy = x + w / 2, y + h / 2
     return cv2.pointPolygonTest(pts, (cx, cy), False) >= 0
 
-def draw_fish_contours(frame, contours, boxes, time_spent, fps, frame_skip):
+def draw_fish_contours(enhanced, contours, boxes, time_spent, original_fps, frame_skip=1):
     """
-    Draw contours and update time spent in each box.
-    """
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    Draws contours on the frame and updates time spent in each box only once per frame
+    if any contour is detected inside the box. This prevents adding extra time if multiple
+    contours are detected within the same box on a single frame.
 
-        # Check if the fish is within any defined box
+    Args:
+        enhanced: The image/frame to draw on.
+        contours: List of detected contours.
+        boxes: List of box dictionaries with a "coords" key.
+        time_spent: List to accumulate time for each box.
+        original_fps: The original FPS of the video.
+        frame_skip: Number of skipped frames; each processed frame represents frame_skip/original_fps seconds.
+    """
+    detected_boxes = [False] * len(boxes)
+
+    for contour in contours:
+        if contour.dtype != np.int32:
+            contour = contour.astype(np.int32)
+        if cv2.contourArea(contour) < 10:
+            continue  
+
+        x, y, w, h = cv2.boundingRect(contour)
+        cv2.rectangle(enhanced, (x, y), (x + w, y + h), (255, 255, 255), 2)
+
+        
+        cv2.drawContours(enhanced, [contour], -1, (255, 255, 255), 1)
+
         for i, box in enumerate(boxes):
-            if box.contains(x, y, w, h):
-                time_spent[i] += frame_skip / fps
+            if is_contour_in_box(contour, box):
+                detected_boxes[i] = True
+
+    for i, detected in enumerate(detected_boxes):
+        if detected:
+            time_spent[i] += frame_skip / original_fps
 
 def log_video_info(cap):
     print("Logging video information...")
@@ -297,25 +317,31 @@ def handle_key_press(key):
     return False
 
 def main():
-    """
-    Main function to process the video and track fish.
-    """
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Downloads/n2.mov"
+    path = "/Users/manasvenkatasairavulapalli/Downloads/WIN_20250206_17_25_13_Pro.mp4"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
 
+    # Create an instance of BoxManager
     box_manager = BoxManager()
+
     box_data = define_boxes(path)
     print("User-defined boxes:", box_data)
 
+    # CSV file setup for logging fish detection coordinates
+    csv_filename = "fish_coordinates.csv"
+    csv_file = open(csv_filename, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    # Write header: frame index, contour id, center_x, center_y
+    csv_writer.writerow(["frame", "contour_id", "center_x", "center_y"])
+
     # Processing parameters
-    frame_skip = 2
-    scale_factor = 0.7
+    frame_skip = 1
+    scale_factor = 1.0
     brightness_increase = 35
     contrast_clip_limit = 0.8
-    min_contour_area = 15
+    min_contour_area = 15 
 
     clahe = cv2.createCLAHE(clipLimit=contrast_clip_limit, tileGridSize=(8,8))
     fgbg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=30, detectShadows=False)
@@ -332,29 +358,47 @@ def main():
         if not ret:
             break
 
+        # Skip frames based on frame_skip
         if frame_count % frame_skip != 0:
             frame_count += 1
             pbar.update(1)
             continue
 
+        # Process frame
         enhanced, contours = process_frame(frame, fgbg, clahe, brightness_increase, scale_factor)
 
-        if scale_factor != 1.0:
+        # Scale contours back to original size and convert to integers
+        if scale_factor != 0.0:
             contours = [np.round(c / scale_factor).astype(np.int32) for c in contours]
 
-        draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, frame_skip)
+        # Log contour center coordinates to CSV for the current frame using moments
+        for idx, contour in enumerate(contours):
+            if cv2.contourArea(contour) < 10:
+                continue  # Skip tiny contours
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                center_x = int(M["m10"] / M["m00"])
+                center_y = int(M["m01"] / M["m00"])
+                csv_writer.writerow([frame_count, idx, center_x, center_y])
+            else:
+                # Handle the case where the contour area is zero
+                csv_writer.writerow([frame_count, idx, 0, 0])
 
-        cv2.imshow("frame", enhanced)
+        draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, frame_skip=frame_skip)
+
+        cv2.imshow("frame", enhanced)  # Display the enhanced (grayscale) frame with contours
         pbar.update(1)
         frame_count += 1
 
         key = cv2.waitKey(1) & 0xFF
-        box_manager.handle_key_press(key)
+        box_manager.handle_key_press(key)  # Use the box_manager instance to handle key press
 
     pbar.close()
     cap.release()
+    csv_file.close()  # Close the CSV file after processing
     cv2.destroyAllWindows()
 
+    # Update box_data with time spent information
     for i, (box_name, box_info) in enumerate(box_data.items()):
         box_info["time"] = time_spent[i]
         print(f"Time spent in {box_name}: {time_spent[i]:.2f} seconds")
