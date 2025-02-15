@@ -204,7 +204,7 @@ def handle_key_press(key):
 
 def main():
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/clips/clip_1.mp4"
+    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n2.mov"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
@@ -235,86 +235,102 @@ def main():
     
     print("User-defined boxes:", box_data)
 
-    # Commenting out CSV file setup for logging fish detection coordinates
-    # csv_filename = "fish_coordinates.csv"
-    # csv_file = open(csv_filename, 'w', newline='')
-    # csv_writer = csv.writer(csv_file)
-    # Write header: frame index, contour id, center_x, center_y
-    # csv_writer.writerow(["frame", "contour_id", "center_x", "center_y"])
+    # Extract video filename without extension
+    video_filename = os.path.splitext(os.path.basename(path))[0]
 
-    # Processing parameters
-    frame_skip = 1
-    scale_factor = 1.0
-    brightness_increase = 35
-    contrast_clip_limit = 0.8
-    min_contour_area = 15 
+    # Create a directory for the current video file
+    output_dir = f"/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Data/{video_filename}"
+    os.makedirs(output_dir, exist_ok=True)
 
-    clahe = cv2.createCLAHE(clipLimit=contrast_clip_limit, tileGridSize=(8,8))
-    fgbg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=30, detectShadows=False)
+    # Setup for logging coordinates to a CSV file
+    coord_filename = os.path.join(output_dir, f"coord_{video_filename}.csv")
+    with open(coord_filename, 'w', newline='') as coord_file:
+        coord_writer = csv.writer(coord_file)
+        # Write header: box name, coordinates
+        coord_writer.writerow(["box_name", "coordinates"])
+        for box_name, box_info in box_data.items():
+            coord_writer.writerow([box_name, box_info["coords"]])
 
-    frame_count = 0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    original_fps = cap.get(cv2.CAP_PROP_FPS)
-    time_spent = [0] * len(box_data)
+    # Setup for logging time spent in each box to a CSV file
+    data_filename = os.path.join(output_dir, f"data_{video_filename}.csv")
+    with open(data_filename, 'w', newline='') as data_file:
+        data_writer = csv.writer(data_file)
+        # Write header: box name, time spent
+        data_writer.writerow(["box_name", "time_spent"])
 
-    pbar = tqdm(total=total_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
+        # Setup for logging center coordinates of contours
+        center_filename = os.path.join(output_dir, f"center_{video_filename}.csv")
+        with open(center_filename, 'w', newline='') as center_file:
+            center_writer = csv.writer(center_file)
+            # Write header: frame index, contour id, center_x, center_y
+            center_writer.writerow(["frame", "contour_id", "center_x", "center_y"])
 
-    # Calculate the maximum number of frames to process (5 minutes)
-    max_frames = int(original_fps * 5 * 60)
+            # Processing parameters
+            frame_skip = 1
+            scale_factor = 1.0
+            brightness_increase = 35
+            contrast_clip_limit = 0.8
+            min_contour_area = 15 
 
-    while True:
-        ret, frame = cap.read()
-        if not ret or frame_count >= max_frames:
-            break
+            clahe = cv2.createCLAHE(clipLimit=contrast_clip_limit, tileGridSize=(8,8))
+            fgbg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=30, detectShadows=False)
 
-        # Skip frames based on frame_skip
-        if frame_count % frame_skip != 0:
-            frame_count += 1
-            pbar.update(1)
-            continue
+            frame_count = 0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            original_fps = cap.get(cv2.CAP_PROP_FPS)
+            time_spent = [0] * len(box_data)
 
-        # Process frame
-        enhanced, contours = process_frame(frame, fgbg, clahe, brightness_increase, scale_factor)
+            pbar = tqdm(total=total_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
 
-        # Scale contours back to original size and convert to integers
-        if scale_factor != 0.0:
-            contours = [np.round(c / scale_factor).astype(np.int32) for c in contours]
+            # Calculate the maximum number of frames to process (5 minutes)
+            max_frames = int(original_fps * 5 * 60)
 
-        # Commenting out logging contour center coordinates to CSV for the current frame using moments
-        # for idx, contour in enumerate(contours):
-        #     if cv2.contourArea(contour) < 10:
-        #         continue  # Skip tiny contours
-        #     M = cv2.moments(contour)
-        #     if M["m00"] != 0:
-        #         center_x = int(M["m10"] / M["m00"])
-        #         center_y = int(M["m01"] / M["m00"])
-        #         csv_writer.writerow([frame_count, idx, center_x, center_y])
-        #     else:
-        #         # Handle the case where the contour area is zero
-        #         csv_writer.writerow([frame_count, idx, 0, 0])
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame_count >= max_frames:
+                    break
 
-        draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, frame_skip=frame_skip)
+                # Skip frames based on frame_skip
+                if frame_count % frame_skip != 0:
+                    frame_count += 1
+                    pbar.update(1)
+                    continue
 
-        cv2.imshow("frame", enhanced)  # Display the enhanced (grayscale) frame with contours
-        pbar.update(1)
-        frame_count += 1
+                # Process frame
+                enhanced, contours = process_frame(frame, fgbg, clahe, brightness_increase, scale_factor)
 
-        key = cv2.waitKey(1) & 0xFF
-        box_manager.handle_key_press(key)  # Use the box_manager instance to handle key press
+                # Scale contours back to original size and convert to integers
+                if scale_factor != 0.0:
+                    contours = [np.round(c / scale_factor).astype(np.int32) for c in contours]
 
-    pbar.close()
-    cap.release()
-    # csv_file.close()  # Close the CSV file after processing
-    cv2.destroyAllWindows()
+                # Log center coordinates of contours
+                for idx, contour in enumerate(contours):
+                    if cv2.contourArea(contour) < 10:
+                        continue  # Skip tiny contours
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        center_x = int(M["m10"] / M["m00"])
+                        center_y = int(M["m01"] / M["m00"])
+                        center_writer.writerow([frame_count, idx, center_x, center_y])
 
-    # Update box_data with time spent information
-    for i, (box_name, box_info) in enumerate(box_data.items()):
-        box_info["time"] = time_spent[i]
-        print(f"Time spent in {box_name}: {time_spent[i]:.2f} seconds")
+                draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, frame_skip=frame_skip)
 
-    return box_data
+                cv2.imshow("frame", enhanced)  # Display the enhanced (grayscale) frame with contours
+                pbar.update(1)
+                frame_count += 1
+
+                key = cv2.waitKey(1) & 0xFF
+                box_manager.handle_key_press(key)  # Use the box_manager instance to handle key press
+
+            pbar.close()
+            cap.release()
+            cv2.destroyAllWindows()
+
+            # Write time spent in each box to the CSV file
+            for i, (box_name, box_info) in enumerate(box_data.items()):
+                box_info["time"] = time_spent[i]
+                data_writer.writerow([box_name, time_spent[i]])
 
 if __name__ == "__main__":
-    box_data = main()
-    print("Returned box data:", box_data)
+    main()
 
