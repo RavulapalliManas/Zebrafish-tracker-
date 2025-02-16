@@ -104,9 +104,18 @@ def initialize_video_capture(path):
 def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     if scale_factor != 1.0:
         frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Apply Non-Local Means Denoising
+    denoised_frame = cv2.fastNlMeansDenoisingColored(frame, None, h=10, hForColorComponents=10, templateWindowSize=7, searchWindowSize=21)
+    
+    gray = cv2.cvtColor(denoised_frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.add(gray, brightness_increase)
-    enhanced = clahe.apply(gray)
+    
+    # Apply Gaussian Blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Use CLAHE for contrast enhancement
+    enhanced = clahe.apply(blurred)
     
     return enhanced, scale_factor
 
@@ -118,7 +127,11 @@ def detect_fish(enhanced, fgbg, min_contour_area=10):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     eroded_mask = cv2.erode(fg_mask, kernel, iterations=1)
     dilated_mask = cv2.dilate(eroded_mask, kernel, iterations=1)
-    contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Use Canny edge detection
+    edges = cv2.Canny(dilated_mask, 50, 150)
+    
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
@@ -215,7 +228,7 @@ def write_center_data(center_writer, frame_count, idx, center_x, center_y, insta
 
 def main():
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n1.mov"
+    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n2.mov"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
@@ -268,14 +281,14 @@ def main():
             min_contour_area = 15 
 
             clahe = cv2.createCLAHE(clipLimit=contrast_clip_limit, tileGridSize=(8,8))
-            fgbg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=30, detectShadows=False)
+            fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=True)
 
             frame_count = 0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             original_fps = cap.get(cv2.CAP_PROP_FPS)
             time_spent = [0] * len(box_data)
 
-            max_frames = min(9000, total_frames)
+            max_frames = max(9000, total_frames)
             pbar = tqdm(total=max_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
 
             previous_center = None
@@ -289,6 +302,7 @@ def main():
 
                 enhanced, contours, current_center = process_frame(frame, fgbg, clahe, brightness_increase, scale_factor)
 
+                # Re-enable speed calculation
                 if current_center and previous_center:
                     dx = current_center[0] - previous_center[0]
                     dy = current_center[1] - previous_center[1]
@@ -301,17 +315,20 @@ def main():
 
                 previous_center = current_center
 
+                contour_areas = []  # Initialize an empty list to store contour areas
                 for idx, contour in enumerate(contours):
                     area = cv2.contourArea(contour)
                     if area < 10:
                         continue
+                    contour_areas.append(area)  # Append the area to the list
                     M = cv2.moments(contour)
                     if M["m00"] != 0:
                         center_x = int(M["m10"] / M["m00"])
                         center_y = int(M["m01"] / M["m00"])
+                        # Write center data with speed
                         write_center_data(center_writer, frame_count, idx, center_x, center_y, instantaneous_speed)
 
-                draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, contour_areas=[area])
+                draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, contour_areas=contour_areas)
 
                 pbar.update(1)
                 frame_count += 1
@@ -320,6 +337,7 @@ def main():
             cap.release()
             cv2.destroyAllWindows()
 
+            # Re-enable average speed calculation
             for i, (box_name, box_info) in enumerate(box_data.items()):
                 box_info["time"] = time_spent[i]
                 average_speed = total_speed / speed_count if speed_count > 0 else 0
