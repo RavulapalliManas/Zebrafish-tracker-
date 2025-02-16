@@ -4,6 +4,8 @@ import argparse
 import os
 import sys
 import json
+import csv  
+import time
 from tqdm import tqdm
 import csv  
 import tkinter as tk
@@ -102,39 +104,43 @@ def initialize_video_capture(path):
 def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     if scale_factor != 1.0:
         frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
-    
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
     gray = cv2.add(gray, brightness_increase)
-    
     enhanced = clahe.apply(gray)
     
     return enhanced, scale_factor
 
 def detect_fish(enhanced, fgbg, min_contour_area=10):
     """
-    Detect fish in the given frame using background subtraction and contour detection.
+    Detect the largest fish in the given frame using background subtraction and contour detection.
     """
     fg_mask = fgbg.apply(enhanced)
-    
-    # Define a kernel for morphological operations
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    
-    # Apply erosion to remove noise
     eroded_mask = cv2.erode(fg_mask, kernel, iterations=1)
-    
-    # Apply dilation to close gaps
     dilated_mask = cv2.dilate(eroded_mask, kernel, iterations=1)
-    
-    # Use the cleaned mask for contour detection
     contours, _ = cv2.findContours(dilated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    return [c for c in contours if cv2.contourArea(c) > min_contour_area]
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest_contour) > min_contour_area:
+            return [largest_contour]
+    
+    return []
 
 def process_frame(frame, fgbg, clahe, brightness_increase, scale_factor):
     enhanced, _ = preprocess_frame(frame, brightness_increase, clahe, scale_factor)
     contours = detect_fish(enhanced, fgbg)
-    return enhanced, contours
+    
+    # Calculate the center of the largest contour
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+        if M["m00"] != 0:
+            center_x = int(M["m10"] / M["m00"])
+            center_y = int(M["m01"] / M["m00"])
+            return enhanced, contours, (center_x, center_y)
+    
+    return enhanced, contours, None
 
 def is_contour_in_box(contour, box):
     """
@@ -153,41 +159,32 @@ def is_contour_in_box(contour, box):
     cx, cy = x + w / 2, y + h / 2
     return cv2.pointPolygonTest(pts, (cx, cy), False) >= 0
 
-def draw_fish_contours(enhanced, contours, boxes, time_spent, original_fps, frame_skip=1):
+def draw_fish_contours(enhanced, contours, boxes, time_spent, original_fps, contour_areas=None):
     """
-    Draws contours on the frame and updates time spent in each box only once per frame
-    if any contour is detected inside the box. This prevents adding extra time if multiple
-    contours are detected within the same box on a single frame.
-
-    Args:
-        enhanced: The image/frame to draw on.
-        contours: List of detected contours.
-        boxes: List of box dictionaries with a "coords" key.
-        time_spent: List to accumulate time for each box.
-        original_fps: The original FPS of the video.
-        frame_skip: Number of skipped frames; each processed frame represents frame_skip/original_fps seconds.
+    Draws contours on the frame and updates time spent in each box.
     """
     detected_boxes = [False] * len(boxes)
 
-    for contour in contours:
+    for i, contour in enumerate(contours):
         if contour.dtype != np.int32:
             contour = contour.astype(np.int32)
-        if cv2.contourArea(contour) < 10:
+        
+        # Use the pre-calculated area if provided
+        area = contour_areas[i] if contour_areas else cv2.contourArea(contour)
+        if area < 10:
             continue  
 
         x, y, w, h = cv2.boundingRect(contour)
         cv2.rectangle(enhanced, (x, y), (x + w, y + h), (255, 255, 255), 2)
-
-        
         cv2.drawContours(enhanced, [contour], -1, (255, 255, 255), 1)
 
-        for i, box in enumerate(boxes):
+        for j, box in enumerate(boxes):
             if is_contour_in_box(contour, box):
-                detected_boxes[i] = True
+                detected_boxes[j] = True
 
     for i, detected in enumerate(detected_boxes):
         if detected:
-            time_spent[i] += frame_skip / original_fps
+            time_spent[i] += 1 / original_fps
 
 def log_video_info(cap):
     print("Logging video information...")
@@ -202,27 +199,36 @@ def handle_key_press(key):
         sys.exit()  
     return False
 
+def write_center_data(center_writer, frame_count, idx, center_x, center_y, instantaneous_speed):
+    """
+    Write the center data to the CSV file.
+    
+    Args:
+        center_writer: CSV writer object for the center file.
+        frame_count: Current frame number.
+        idx: Contour index.
+        center_x: X-coordinate of the center.
+        center_y: Y-coordinate of the center.
+        instantaneous_speed: Calculated instantaneous speed.
+    """
+    center_writer.writerow([frame_count, idx, center_x, center_y, instantaneous_speed])
+
 def main():
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n2.mov"
+    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n1.mov"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
 
-    # Create an instance of BoxManager
     box_manager = BoxManager()
-
-    # Prompt user for input method
     user_choice = input("Would you like to (d)raw boxes or provide (c)oordinates? (d/c): ").strip().lower()
 
     if user_choice == 'c':
-        # Allow user to input coordinates
         num_boxes = int(input("Enter the number of boxes you want to define: "))
         for i in range(num_boxes):
             print(f"Enter coordinates for Box {i+1} (format: x1,y1 x2,y2 x3,y3 x4,y4):")
             coords_input = input().strip()
             try:
-                # Parse the input into a list of tuples
                 coordinates = [tuple(map(int, point.split(','))) for point in coords_input.split()]
                 box_manager.add_box_from_coordinates(coordinates, label=f"User Box {i+1}")
             except ValueError:
@@ -230,42 +236,31 @@ def main():
                 return
         box_data = box_manager.get_box_data()
     else:
-        # Default to drawing boxes
         box_data = define_boxes(path)
     
     print("User-defined boxes:", box_data)
 
-    # Extract video filename without extension
     video_filename = os.path.splitext(os.path.basename(path))[0]
-
-    # Create a directory for the current video file
     output_dir = f"/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Data/{video_filename}"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Setup for logging coordinates to a CSV file
     coord_filename = os.path.join(output_dir, f"coord_{video_filename}.csv")
     with open(coord_filename, 'w', newline='') as coord_file:
         coord_writer = csv.writer(coord_file)
-        # Write header: box name, coordinates
         coord_writer.writerow(["box_name", "coordinates"])
         for box_name, box_info in box_data.items():
             coord_writer.writerow([box_name, box_info["coords"]])
 
-    # Setup for logging time spent in each box to a CSV file
     data_filename = os.path.join(output_dir, f"data_{video_filename}.csv")
     with open(data_filename, 'w', newline='') as data_file:
         data_writer = csv.writer(data_file)
-        # Write header: box name, time spent
-        data_writer.writerow(["box_name", "time_spent"])
+        data_writer.writerow(["box_name", "time_spent (s)", "average_speed (px/s)"])
 
-        # Setup for logging center coordinates of contours
         center_filename = os.path.join(output_dir, f"center_{video_filename}.csv")
         with open(center_filename, 'w', newline='') as center_file:
             center_writer = csv.writer(center_file)
-            # Write header: frame index, contour id, center_x, center_y
-            center_writer.writerow(["frame", "contour_id", "center_x", "center_y"])
+            center_writer.writerow(["frame", "contour_id", "center_x (px)", "center_y (px)", "instantaneous_speed (px/s)"])
 
-            # Processing parameters
             frame_skip = 1
             scale_factor = 1.0
             brightness_increase = 35
@@ -280,56 +275,55 @@ def main():
             original_fps = cap.get(cv2.CAP_PROP_FPS)
             time_spent = [0] * len(box_data)
 
-            pbar = tqdm(total=total_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
+            max_frames = min(9000, total_frames)
+            pbar = tqdm(total=max_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
 
-            # Calculate the maximum number of frames to process (5 minutes)
-            max_frames = int(original_fps * 5 * 60)
+            previous_center = None
+            total_speed = 0
+            speed_count = 0
 
             while True:
                 ret, frame = cap.read()
                 if not ret or frame_count >= max_frames:
                     break
 
-                # Skip frames based on frame_skip
-                if frame_count % frame_skip != 0:
-                    frame_count += 1
-                    pbar.update(1)
-                    continue
+                enhanced, contours, current_center = process_frame(frame, fgbg, clahe, brightness_increase, scale_factor)
 
-                # Process frame
-                enhanced, contours = process_frame(frame, fgbg, clahe, brightness_increase, scale_factor)
+                if current_center and previous_center:
+                    dx = current_center[0] - previous_center[0]
+                    dy = current_center[1] - previous_center[1]
+                    distance = np.sqrt(dx**2 + dy**2)
+                    instantaneous_speed = distance * original_fps
+                    total_speed += instantaneous_speed
+                    speed_count += 1
+                else:
+                    instantaneous_speed = 0
 
-                # Scale contours back to original size and convert to integers
-                if scale_factor != 0.0:
-                    contours = [np.round(c / scale_factor).astype(np.int32) for c in contours]
+                previous_center = current_center
 
-                # Log center coordinates of contours
                 for idx, contour in enumerate(contours):
-                    if cv2.contourArea(contour) < 10:
-                        continue  # Skip tiny contours
+                    area = cv2.contourArea(contour)
+                    if area < 10:
+                        continue
                     M = cv2.moments(contour)
                     if M["m00"] != 0:
                         center_x = int(M["m10"] / M["m00"])
                         center_y = int(M["m01"] / M["m00"])
-                        center_writer.writerow([frame_count, idx, center_x, center_y])
+                        write_center_data(center_writer, frame_count, idx, center_x, center_y, instantaneous_speed)
 
-                draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, frame_skip=frame_skip)
+                draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, contour_areas=[area])
 
-                cv2.imshow("frame", enhanced)  # Display the enhanced (grayscale) frame with contours
                 pbar.update(1)
                 frame_count += 1
-
-                key = cv2.waitKey(1) & 0xFF
-                box_manager.handle_key_press(key)  # Use the box_manager instance to handle key press
 
             pbar.close()
             cap.release()
             cv2.destroyAllWindows()
 
-            # Write time spent in each box to the CSV file
             for i, (box_name, box_info) in enumerate(box_data.items()):
                 box_info["time"] = time_spent[i]
-                data_writer.writerow([box_name, time_spent[i]])
+                average_speed = total_speed / speed_count if speed_count > 0 else 0
+                data_writer.writerow([box_name, time_spent[i], average_speed])
 
 if __name__ == "__main__":
     main()
