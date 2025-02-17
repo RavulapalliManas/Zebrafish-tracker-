@@ -105,10 +105,7 @@ def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     if scale_factor != 1.0:
         frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
     
-    # Apply Non-Local Means Denoising
-    denoised_frame = cv2.fastNlMeansDenoisingColored(frame, None, h=10, hForColorComponents=10, templateWindowSize=7, searchWindowSize=21)
-    
-    gray = cv2.cvtColor(denoised_frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.add(gray, brightness_increase)
     
     # Apply Gaussian Blur to reduce noise
@@ -276,9 +273,9 @@ def main():
 
             frame_skip = 1
             scale_factor = 1.0
-            brightness_increase = 35
-            contrast_clip_limit = 0.8
-            min_contour_area = 15 
+            brightness_increase = 39
+            contrast_clip_limit = 0.85
+            min_contour_area = 15
 
             clahe = cv2.createCLAHE(clipLimit=contrast_clip_limit, tileGridSize=(8,8))
             fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=True)
@@ -288,7 +285,7 @@ def main():
             original_fps = cap.get(cv2.CAP_PROP_FPS)
             time_spent = [0] * len(box_data)
 
-            max_frames = max(9000, total_frames)
+            max_frames = min(9000, total_frames)
             pbar = tqdm(total=max_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
 
             previous_center = None
