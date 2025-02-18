@@ -254,13 +254,15 @@ def process_files_in_batches():
         download_func = download_file_gdrive
         delete_func = delete_file_gdrive
     elif storage_choice == '3':
-        directory_path = input("Enter the local directory path: ").strip()
+        directory_path = input("Enter the local directory path for input videos: ").strip()
         files = [{'name': f, 'id': f} for f in os.listdir(directory_path) if f.endswith(('.mp4', '.mov', '.avi'))]
         download_func = lambda *args: None  # No download needed for local files
         delete_func = lambda *args: None  # No delete needed for local files
     else:
         print("Invalid choice. Exiting.")
         return
+
+    output_base_dir = input("Enter the output directory path: ").strip()
 
     batch_size = 5
     for i in range(0, len(files), batch_size):
@@ -275,7 +277,7 @@ def process_files_in_batches():
             box_data = input_box_coordinates()
             
             # Process the video file to generate CSVs
-            output_dir = f"/path/to/output/directory/{os.path.splitext(file_name)[0]}"
+            output_dir = os.path.join(output_base_dir, os.path.splitext(file_name)[0])
             process_video(file_name, box_data, output_dir)
             
             # Delete the file after processing if not local
