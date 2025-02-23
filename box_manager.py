@@ -5,9 +5,11 @@ import sys
 
 class BoxManager:
     def __init__(self):
-        self.boxes = [] 
+        self.boxes = []
         self.labels = []
         self.drawing = False
+        self.current_box = []
+        self.frame = None
         self.current_box_start = None
         self.current_box_end = None
         self.selected_box_index = None
@@ -26,6 +28,28 @@ class BoxManager:
         """Return True if the point is inside the polygon defined by the box."""
         pts = np.array(box, np.int32).reshape((-1, 1, 2))
         return cv2.pointPolygonTest(pts, point, False) >= 0
+
+    def mouse_callback(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.drawing = True
+            self.current_box = [(x, y)]
+            
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if self.drawing:
+                frame_copy = self.frame.copy()
+                cv2.rectangle(frame_copy, self.current_box[0], (x, y), (0, 255, 0), 2)
+                for box in self.boxes:
+                    cv2.rectangle(frame_copy, box[0], box[1], (0, 255, 0), 2)
+                cv2.imshow('Draw Boxes', frame_copy)
+                
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.drawing = False
+            self.current_box.append((x, y))
+            self.boxes.append(self.current_box)
+            frame_copy = self.frame.copy()
+            for box in self.boxes:
+                cv2.rectangle(frame_copy, box[0], box[1], (0, 255, 0), 2)
+            cv2.imshow('Draw Boxes', frame_copy)
 
     def handle_mouse_event(self, event, x, y, flags, param):
         point = (x, y)

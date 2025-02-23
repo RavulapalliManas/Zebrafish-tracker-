@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
 # Load the data
-data = pd.read_csv('fish_coordinates.csv')
+data = pd.read_csv('/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Data/n1cropped/center_n1cropped.csv')
 
 # Create a figure and axis
 fig, ax = plt.subplots()
