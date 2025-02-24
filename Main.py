@@ -15,6 +15,8 @@ import multiprocessing as mp
 
 from box_manager import BoxManager
 
+MAX_DISTANCE_THRESHOLD = 150 # Maximum allowed distance in pixels
+
 def define_boxes(video_path, original_fps=30, slowed_fps=10, config_file=None):
     """
     Allows the user to interactively draw and modify boxes on the first frame of the video.
@@ -227,16 +229,13 @@ def write_center_data(center_writer, frame_count, idx, center_x, center_y, insta
 
 def main():
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n2.mov"
+    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n1.mov"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
 
     # Add pixel to meter conversion constant
     PIXEL_TO_METER = 0.000099
-
-    # Create window for video display
-    cv2.namedWindow('Video Processing', cv2.WINDOW_NORMAL)
 
     box_manager = BoxManager()
     user_choice = input("Would you like to (d)raw boxes or provide (c)oordinates? (d/c): ").strip().lower()
@@ -307,45 +306,29 @@ def main():
 
                 enhanced, contours, current_center = process_frame(frame, fgbg, clahe, brightness_increase, scale_factor)
 
-                # Draw boxes on the frame
-                display_frame = frame.copy()
-                for box_name, box_info in box_data.items():
-                    pts = np.array(box_info["coords"], dtype=np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(display_frame, [pts], True, (0, 255, 0), 2)
-                    # Add box label
-                    x, y = box_info["coords"][0]
-                    cv2.putText(display_frame, box_name, (x, y-10), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # Initialize instantaneous_speed
+                instantaneous_speed = 0  # Default value
 
-                # Draw contours on display frame
-                for contour in contours:
-                    cv2.drawContours(display_frame, [contour], -1, (0, 0, 255), 2)
-                    if current_center:
-                        cv2.circle(display_frame, current_center, 5, (255, 0, 0), -1)
-
-                # Show processing information
-                cv2.putText(display_frame, f'Frame: {frame_count}/{max_frames}', (10, 30),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                # Display the frame
-                cv2.imshow('Video Processing', display_frame)
-                
-                # Handle key presses
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("Processing interrupted by user")
-                    break
-
-                # Rest of the existing processing code
+                # Check distance and process next largest contour if threshold exceeded
                 if current_center and previous_center:
                     dx = current_center[0] - previous_center[0]
                     dy = current_center[1] - previous_center[1]
                     distance = np.sqrt(dx**2 + dy**2)
-                    instantaneous_speed = distance * original_fps * PIXEL_TO_METER
+
+                    if distance > MAX_DISTANCE_THRESHOLD:
+                        # Find the next largest contour
+                        if len(contours) > 1:
+                            sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+                            next_largest_contour = sorted_contours[1]  # Get the second largest contour
+                            contours = [next_largest_contour]  # Replace contours with the next largest contour
+                        else:
+                            contours = []  # No valid contours to process
+
+                    instantaneous_speed = distance * original_fps * PIXEL_TO_METER  # Calculate speed
                     total_speed += instantaneous_speed
                     speed_count += 1
                 else:
-                    instantaneous_speed = 0
+                    instantaneous_speed = 0  # No movement detected
 
                 previous_center = current_center
 
@@ -369,7 +352,6 @@ def main():
 
             pbar.close()
             cap.release()
-            cv2.destroyAllWindows()
 
             # Update the data writer to show m/s
             data_writer.writerow(["box_name", "time_spent (s)", "average_speed (m/s)"])
