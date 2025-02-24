@@ -116,7 +116,7 @@ def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     
     return enhanced, scale_factor
 
-def detect_fish(enhanced, fgbg, min_contour_area=10):
+def detect_fish(enhanced, fgbg, min_contour_area=10, max_contour_area=1350):
     """
     Detect the largest fish in the given frame using background subtraction and contour detection.
     """
@@ -131,8 +131,10 @@ def detect_fish(enhanced, fgbg, min_contour_area=10):
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest_contour) > min_contour_area:
+        # Filter contours based on area
+        valid_contours = [cnt for cnt in contours if min_contour_area < cv2.contourArea(cnt) < max_contour_area]
+        if valid_contours:
+            largest_contour = max(valid_contours, key=cv2.contourArea)
             return [largest_contour]
     
     return []
@@ -181,7 +183,7 @@ def draw_fish_contours(enhanced, contours, boxes, time_spent, original_fps, cont
         
         # Use the pre-calculated area if provided
         area = contour_areas[i] if contour_areas else cv2.contourArea(contour)
-        if area < 10:
+        if area < 10 or area > 1350:  # Add max area check here
             continue  
 
         x, y, w, h = cv2.boundingRect(contour)
@@ -219,7 +221,7 @@ def write_center_data(center_writer, frame_count, idx, center_x, center_y, insta
         idx: Contour index.
         center_x: X-coordinate of the center.
         center_y: Y-coordinate of the center.
-        instantaneous_speed: Calculated instantaneous speed.
+        instantaneous_speed: Calculated instantaneous speed in m/s.
     """
     center_writer.writerow([frame_count, idx, center_x, center_y, instantaneous_speed])
 
@@ -229,6 +231,12 @@ def main():
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
+
+    # Add pixel to meter conversion constant
+    PIXEL_TO_METER = 0.000099
+
+    # Create window for video display
+    cv2.namedWindow('Video Processing', cv2.WINDOW_NORMAL)
 
     box_manager = BoxManager()
     user_choice = input("Would you like to (d)raw boxes or provide (c)oordinates? (d/c): ").strip().lower()
@@ -264,12 +272,12 @@ def main():
     data_filename = os.path.join(output_dir, f"data_{video_filename}.csv")
     with open(data_filename, 'w', newline='') as data_file:
         data_writer = csv.writer(data_file)
-        data_writer.writerow(["box_name", "time_spent (s)", "average_speed (px/s)"])
+        data_writer.writerow(["box_name", "time_spent (s)", "average_speed (m/s)"])
 
         center_filename = os.path.join(output_dir, f"center_{video_filename}.csv")
         with open(center_filename, 'w', newline='') as center_file:
             center_writer = csv.writer(center_file)
-            center_writer.writerow(["frame", "contour_id", "center_x (px)", "center_y (px)", "instantaneous_speed (px/s)"])
+            center_writer.writerow(["frame", "contour_id", "center_x (px)", "center_y (px)", "instantaneous_speed (m/s)"])
 
             frame_skip = 1
             scale_factor = 1.0
@@ -299,12 +307,41 @@ def main():
 
                 enhanced, contours, current_center = process_frame(frame, fgbg, clahe, brightness_increase, scale_factor)
 
-                # Re-enable speed calculation
+                # Draw boxes on the frame
+                display_frame = frame.copy()
+                for box_name, box_info in box_data.items():
+                    pts = np.array(box_info["coords"], dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(display_frame, [pts], True, (0, 255, 0), 2)
+                    # Add box label
+                    x, y = box_info["coords"][0]
+                    cv2.putText(display_frame, box_name, (x, y-10), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                # Draw contours on display frame
+                for contour in contours:
+                    cv2.drawContours(display_frame, [contour], -1, (0, 0, 255), 2)
+                    if current_center:
+                        cv2.circle(display_frame, current_center, 5, (255, 0, 0), -1)
+
+                # Show processing information
+                cv2.putText(display_frame, f'Frame: {frame_count}/{max_frames}', (10, 30),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # Display the frame
+                cv2.imshow('Video Processing', display_frame)
+                
+                # Handle key presses
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("Processing interrupted by user")
+                    break
+
+                # Rest of the existing processing code
                 if current_center and previous_center:
                     dx = current_center[0] - previous_center[0]
                     dy = current_center[1] - previous_center[1]
                     distance = np.sqrt(dx**2 + dy**2)
-                    instantaneous_speed = distance * original_fps
+                    instantaneous_speed = distance * original_fps * PIXEL_TO_METER
                     total_speed += instantaneous_speed
                     speed_count += 1
                 else:
@@ -334,7 +371,9 @@ def main():
             cap.release()
             cv2.destroyAllWindows()
 
-            # Re-enable average speed calculation
+            # Update the data writer to show m/s
+            data_writer.writerow(["box_name", "time_spent (s)", "average_speed (m/s)"])
+            
             for i, (box_name, box_info) in enumerate(box_data.items()):
                 box_info["time"] = time_spent[i]
                 average_speed = total_speed / speed_count if speed_count > 0 else 0
