@@ -12,10 +12,9 @@ import tkinter as tk
 from tkinter import simpledialog
 import pandas as pd
 import multiprocessing as mp
-
 from box_manager import BoxManager
 
-MAX_DISTANCE_THRESHOLD = 150 # Maximum allowed distance in pixels
+MAX_DISTANCE_THRESHOLD = 150 
 
 def define_boxes(video_path, original_fps=30, slowed_fps=10, config_file=None):
     """
@@ -108,12 +107,8 @@ def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
         frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
     
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.add(gray, brightness_increase)
-    
-    # Apply Gaussian Blur to reduce noise
+    gray = cv2.add(gray, brightness_increase)    
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Use CLAHE for contrast enhancement
     enhanced = clahe.apply(blurred)
     
     return enhanced, scale_factor
@@ -126,14 +121,11 @@ def detect_fish(enhanced, fgbg, min_contour_area=10, max_contour_area=1350):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     eroded_mask = cv2.erode(fg_mask, kernel, iterations=1)
     dilated_mask = cv2.dilate(eroded_mask, kernel, iterations=1)
-    
-    # Use Canny edge detection
     edges = cv2.Canny(dilated_mask, 50, 150)
     
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if contours:
-        # Filter contours based on area
         valid_contours = [cnt for cnt in contours if min_contour_area < cv2.contourArea(cnt) < max_contour_area]
         if valid_contours:
             largest_contour = max(valid_contours, key=cv2.contourArea)
@@ -145,7 +137,6 @@ def process_frame(frame, fgbg, clahe, brightness_increase, scale_factor):
     enhanced, _ = preprocess_frame(frame, brightness_increase, clahe, scale_factor)
     contours = detect_fish(enhanced, fgbg)
     
-    # Calculate the center of the largest contour
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
         M = cv2.moments(largest_contour)
