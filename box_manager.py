@@ -8,7 +8,7 @@ class BoxManager:
         self.boxes = []
         self.labels = []
         self.drawing = False
-        self.current_box = []
+        self.current_polygon = []
         self.frame = None
         self.current_box_start = None
         self.current_box_end = None
@@ -16,6 +16,7 @@ class BoxManager:
         self.selected_corner_index = None
         self.moving_box = False
         self.move_start = None
+        self.drawing_polygon = False
 
     def get_near_corner(self, box, point, threshold=10):
         """Return the index of the corner if point is within threshold; else None."""
@@ -30,29 +31,11 @@ class BoxManager:
         return cv2.pointPolygonTest(pts, point, False) >= 0
 
     def mouse_callback(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.drawing = True
-            self.current_box = [(x, y)]
-            
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if self.drawing:
-                frame_copy = self.frame.copy()
-                cv2.rectangle(frame_copy, self.current_box[0], (x, y), (0, 255, 0), 2)
-                for box in self.boxes:
-                    cv2.rectangle(frame_copy, box[0], box[1], (0, 255, 0), 2)
-                cv2.imshow('Draw Boxes', frame_copy)
-                
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.drawing = False
-            self.current_box.append((x, y))
-            self.boxes.append(self.current_box)
-            frame_copy = self.frame.copy()
-            for box in self.boxes:
-                cv2.rectangle(frame_copy, box[0], box[1], (0, 255, 0), 2)
-            cv2.imshow('Draw Boxes', frame_copy)
+        pass
 
     def handle_mouse_event(self, event, x, y, flags, param):
         point = (x, y)
+        
         if event == cv2.EVENT_LBUTTONDOWN:
             for i, box in enumerate(self.boxes):
                 corner_idx = self.get_near_corner(box, point)
@@ -60,19 +43,29 @@ class BoxManager:
                     self.selected_box_index = i
                     self.selected_corner_index = corner_idx
                     return
+                    
             for i, box in enumerate(self.boxes):
                 if self.point_in_box(point, box):
                     self.selected_box_index = i
                     self.moving_box = True
                     self.move_start = point
                     return
-            self.drawing = True
-            self.current_box_start = point
-            self.current_box_end = point
-
+            
+            if not self.drawing_polygon:
+                self.drawing_polygon = True
+                self.current_polygon = [point]
+            else:
+                self.current_polygon.append(point)
+                # Auto-complete the quadrilateral when 4 points are added
+                if len(self.current_polygon) == 4:
+                    self.boxes.append(self.current_polygon.copy())
+                    self.labels.append(f"Box {len(self.boxes)}")
+                    self.drawing_polygon = False
+                    self.current_polygon = []
+        
         elif event == cv2.EVENT_MOUSEMOVE:
-            if self.drawing:
-                self.current_box_end = point
+            if self.drawing_polygon and self.current_polygon:
+                pass
             elif self.selected_corner_index is not None and self.selected_box_index is not None:
                 self.boxes[self.selected_box_index][self.selected_corner_index] = point
             elif self.moving_box and self.selected_box_index is not None and self.move_start is not None:
@@ -83,25 +76,21 @@ class BoxManager:
                 ]
                 self.move_start = point
 
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            if self.drawing_polygon:
+                self.drawing_polygon = False
+                self.current_polygon = []
+
         elif event == cv2.EVENT_LBUTTONUP:
-            if self.drawing:
-                self.drawing = False
-                x1, y1 = self.current_box_start
-                x2, y2 = self.current_box_end
-                x_min, x_max = min(x1, x2), max(x1, x2)
-                y_min, y_max = min(y1, y2), max(y1, y2)
-                new_box = [(x_min, y_min), (x_max, y_min), (x_max, y_max), (x_min, y_max)]
-                self.boxes.append(new_box)
-                self.labels.append(f"Box {len(self.boxes)}")
-                self.current_box_start = None
-                self.current_box_end = None
-            self.selected_box_index = None
-            self.selected_corner_index = None
-            self.moving_box = False
-            self.move_start = None
+            if not self.drawing_polygon:
+                self.selected_box_index = None
+                self.selected_corner_index = None
+                self.moving_box = False
+                self.move_start = None
 
     def draw_boxes(self, frame):
         temp_frame = frame.copy()
+        
         for i, box in enumerate(self.boxes):
             pts = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(temp_frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
@@ -110,14 +99,30 @@ class BoxManager:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             for corner in box:
                 cv2.circle(temp_frame, corner, radius=5, color=(0, 0, 255), thickness=-1)
-        if self.drawing and self.current_box_start and self.current_box_end:
-            cv2.rectangle(temp_frame, self.current_box_start, self.current_box_end, (255, 0, 0), 2)
+        
+        if self.drawing_polygon and self.current_polygon:
+            # Draw lines between points
+            for i in range(len(self.current_polygon) - 1):
+                cv2.line(temp_frame, self.current_polygon[i], self.current_polygon[i+1], 
+                         (255, 0, 0), 2)
+                
+            # Draw all points of the partial polygon
+            for point in self.current_polygon:
+                cv2.circle(temp_frame, point, radius=5, color=(0, 0, 255), thickness=-1)
+                
+            # Show how many more points are needed
+            remaining = 4 - len(self.current_polygon)
+            if remaining > 0:
+                cv2.putText(temp_frame, f"Add {remaining} more point{'s' if remaining > 1 else ''}",
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                
         return temp_frame
 
     def remove_last_box(self):
         if self.boxes:
             self.boxes.pop()
-            self.labels.pop()
+            if self.labels:
+                self.labels.pop()
 
     def get_box_data(self):
         return {label: {"coords": box, "time": 0} for label, box in zip(self.labels, self.boxes)}
@@ -135,24 +140,35 @@ class BoxManager:
 
     def handle_key_press(self, key):
         if key == ord('z'):
-            self.remove_last_box()
+            if self.drawing_polygon and self.current_polygon:
+                if len(self.current_polygon) > 0:
+                    self.current_polygon.pop()
+                if len(self.current_polygon) == 0:
+                    self.drawing_polygon = False
+            else:
+                self.remove_last_box()
         elif key == ord('r'):
             self.boxes = []
             self.labels = []
+            self.drawing_polygon = False
+            self.current_polygon = []
         elif key == ord('q'):
             print("Quit key pressed. Exiting...")
-            sys.exit()  
+            sys.exit()
+        elif key == ord('c'):
+            self.drawing_polygon = False
+            self.current_polygon = []
 
     def add_box_from_coordinates(self, coordinates, label=None):
         """
         Add a box using a list of coordinates.
         
         Args:
-            coordinates: A list of four tuples, each representing a corner of the box.
+            coordinates: A list of exactly four points, each representing a corner of the quadrilateral.
             label: Optional label for the box.
         """
         if len(coordinates) != 4:
-            raise ValueError("Coordinates must contain exactly four points.")
+            raise ValueError("Coordinates must contain exactly four points for a quadrilateral.")
         self.boxes.append(coordinates)
         if label is None:
             label = f"Box {len(self.boxes)}"

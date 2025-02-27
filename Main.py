@@ -1,17 +1,11 @@
 import cv2
 import numpy as np
-import argparse
 import os
 import sys
-import json
 import csv  
-import time
 from tqdm import tqdm
-import csv  
-import tkinter as tk
-from tkinter import simpledialog
-import pandas as pd
-import multiprocessing as mp
+import json 
+import yaml
 from box_manager import BoxManager
 
 MAX_DISTANCE_THRESHOLD = 150 
@@ -159,10 +153,17 @@ def is_contour_in_box(contour, box):
     Returns:
         True if the contour's center is within the box, False otherwise.
     """
+    # Convert box coordinates to the format needed for pointPolygonTest
     pts = np.array(box["coords"], dtype=np.int32).reshape((-1, 1, 2))
-    x, y, w, h = cv2.boundingRect(contour)
-    cx, cy = x + w / 2, y + h / 2
-    return cv2.pointPolygonTest(pts, (cx, cy), False) >= 0
+    
+    # Calculate the center of the contour
+    M = cv2.moments(contour)
+    if M["m00"] != 0:
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        # Check if the center point is inside the polygon
+        return cv2.pointPolygonTest(pts, (cx, cy), False) >= 0
+    return False
 
 def draw_fish_contours(enhanced, contours, boxes, time_spent, original_fps, contour_areas=None):
     """
@@ -238,6 +239,9 @@ def main():
             coords_input = input().strip()
             try:
                 coordinates = [tuple(map(int, point.split(','))) for point in coords_input.split()]
+                if len(coordinates) != 4:
+                    print(f"Error: You must provide exactly 4 points for Box {i+1}. Got {len(coordinates)}.")
+                    continue
                 box_manager.add_box_from_coordinates(coordinates, label=f"User Box {i+1}")
             except ValueError:
                 print("Invalid input format. Please enter coordinates as x,y pairs separated by spaces.")
