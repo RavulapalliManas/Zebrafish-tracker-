@@ -153,40 +153,69 @@ def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
 
 def detect_fish(enhanced, bg_subtractor, min_contour_area=10, max_contour_area=1350):
     """
-    Detect the largest fish in the given frame using background subtraction and contour detection.
+    Detect the largest fish in the given frame using Haar cascades.
 
     Args:
         enhanced (np.array): Preprocessed grayscale frame.
-        bg_subtractor (cv2.BackgroundSubtractorKNN): Background subtractor object.
-        min_contour_area (int, optional): Minimum contour area to consider as fish. Defaults to 10.
-        max_contour_area (int, optional): Maximum contour area to consider as fish. Defaults to 1350.
+        bg_subtractor (cv2.BackgroundSubtractorKNN): Background subtractor object (not used in Haar cascade method).
+        min_contour_area (int, optional): Minimum contour area (not used in Haar cascade method). Defaults to 10.
+        max_contour_area (int, optional): Maximum contour area (not used in Haar cascade method). Defaults to 1350.
 
     Returns:
-        list: List of largest contour if found within area limits, otherwise empty list.
+        list: List of fish detections (rectangles) if found, otherwise empty list.
     """
-    fg_mask = bg_subtractor.apply(enhanced)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    eroded_mask = cv2.erode(fg_mask, kernel, iterations=1)
-    dilated_mask = cv2.dilate(eroded_mask, kernel, iterations=1)
-    edges = cv2.Canny(dilated_mask, 50, 150)
+    # IMPORTANT: You MUST replace 'haarcascade_frontalface_default.xml' with the *correct path*
+    # to your Haar cascade file.  The error "Could not load cascade classifier" means
+    # OpenCV *cannot find the file at the path you provided*.
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 1.  Find the 'haarcascade_frontalface_default.xml' file on your computer.
+    #     It's often located within your OpenCV installation directory.
+    #     (See previous detailed instructions on how to find it based on your OS and install method).
 
-    if contours:
-        valid_contours = [cnt for cnt in contours if min_contour_area < cv2.contourArea(cnt) < max_contour_area]
-        if valid_contours:
-            largest_contour = max(valid_contours, key=cv2.contourArea)
-            return [largest_contour]
+    # 2.  Once you find the file, copy its *full path*.
+    #     Example (this is just an example, your path will be different):
+    #     macOS: '/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml'
+    #     Windows: 'C:\Users\YourUsername\Anaconda3\envs\myenv\Lib\site-packages\cv2\data\haarcascade_frontalface_default.xml'
 
-    return []
+    # 3.  Paste the full path into the cv2.CascadeClassifier() function, replacing the current path.
+    #     Make sure to use raw strings (r'...') for Windows paths to avoid issues with backslashes.
+
+    cascade_path = 'haarcascade_frontalface_default.xml' # <-- REPLACE THIS WITH THE CORRECT PATH
+    if not os.path.exists(cascade_path):
+        print(f"Error: Cascade file not found at path: {cascade_path}")
+        print("Please check that the path to 'haarcascade_frontalface_default.xml' is correct.")
+        print("Refer to the comments in the detect_fish function for detailed instructions.")
+        return []
+
+    fish_cascade = cv2.CascadeClassifier(cascade_path)
+
+    if fish_cascade.empty():
+        print("Error: Could not load cascade classifier.") # This error is now likely due to a corrupted file, not path
+        return []
+
+    fishes = fish_cascade.detectMultiScale(
+        enhanced,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(30, 30),
+        flags=cv2.CASCADE_SCALE_IMAGE
+    )
+
+    detected_contours = []
+    for (x, y, w, h) in fishes:
+        # Haar cascade returns rectangles, convert to contours for consistency if needed
+        contour = np.array([[[x, y]], [[x+w, y]], [[x+w, y+h]], [[x, y+h]]], dtype=np.int32)
+        detected_contours.append(contour)
+
+    return detected_contours
 
 def process_frame(frame, bg_subtractor, clahe, brightness_increase, scale_factor):
     """
-    Processes a single frame to detect fish and its center.
+    Processes a single frame to detect fish and its center using Haar cascades.
 
     Args:
         frame (np.array): Input video frame.
-        bg_subtractor (cv2.BackgroundSubtractorKNN): Background subtractor object.
+        bg_subtractor (cv2.BackgroundSubtractorKNN): Background subtractor object (not used anymore).
         clahe (cv2.CLAHE): CLAHE object for contrast enhancement.
         brightness_increase (int): Brightness increase value.
         scale_factor (float): Frame scaling factor.
@@ -195,7 +224,7 @@ def process_frame(frame, bg_subtractor, clahe, brightness_increase, scale_factor
         tuple: Enhanced frame, detected contours, and center of the largest contour if found, otherwise None for center.
     """
     enhanced, _ = preprocess_frame(frame, brightness_increase, clahe, scale_factor)
-    contours = detect_fish(enhanced, bg_subtractor)
+    contours = detect_fish(enhanced, None)
 
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
@@ -425,8 +454,11 @@ def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, c
     cv2.imshow("Original", original)
     cv2.imshow("Masked", masked)
     cv2.imshow("Enhanced", enhanced)
-    cv2.imshow("Background Mask", fg_mask)
-    cv2.imshow("Edges", edges)
+    # Only display fg_mask and edges if they are not None and valid images
+    # if fg_mask is not None: # No longer needed as fg_mask and edges are not used.
+    #     cv2.imshow("Background Mask", fg_mask)
+    # if edges is not None:
+    #     cv2.imshow("Edges", edges)
 
     if current_center and previous_center:
         cv2.line(fish_vis, previous_center, current_center, (255, 255, 0), 2)
@@ -519,7 +551,6 @@ def main():
             min_contour_area = 15
 
             clahe = cv2.createCLAHE(clipLimit=contrast_clip_limit, tileGridSize=(8,8))
-            bg_subtractor = cv2.createBackgroundSubtractorKNN(history=1000, dist2Threshold=400.0, detectShadows=True)
 
             frame_count = 0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -578,27 +609,12 @@ def main():
                 blurred = cv2.GaussianBlur(gray, (5, 5), 0)
                 enhanced = clahe.apply(blurred)
 
-                fg_mask = bg_subtractor.apply(enhanced)
-                fg_mask = cv2.bitwise_and(fg_mask, tank_mask)
-
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                eroded_mask = cv2.erode(fg_mask, kernel, iterations=1)
-                dilated_mask = cv2.dilate(eroded_mask, kernel, iterations=1)
-                edges = cv2.Canny(dilated_mask, 50, 150)
-
-                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-                valid_contours = []
-                for cnt in contours:
-                    area = cv2.contourArea(cnt)
-
-                    if min_contour_area < area < 1350:
-                        valid_contours.append(cnt)
+                contours = detect_fish(enhanced, None)
 
                 fish_vis = None
                 if enable_visualization:
                     fish_vis = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-                    cv2.drawContours(fish_vis, valid_contours, -1, (0, 255, 0), 2)
+                    cv2.drawContours(fish_vis, contours, -1, (0, 255, 0), 2)
 
                     for box in box_data.values():
                         pts = np.array(box["coords"], dtype=np.int32).reshape((-1, 1, 2))
@@ -608,8 +624,8 @@ def main():
                 is_outside_tank = False
                 is_showing_previous = False
 
-                if valid_contours:
-                    largest_contour = max(valid_contours, key=cv2.contourArea)
+                if contours:
+                    largest_contour = max(contours, key=cv2.contourArea)
                     M = cv2.moments(largest_contour)
                     if M["m00"] != 0:
                         center_x = int(M["m10"] / M["m00"])
@@ -650,7 +666,7 @@ def main():
                     # Visualize only every VISUALIZATION_FRAME_SKIP frames
                     if visualization_frame_count % VISUALIZATION_FRAME_SKIP == 0:
                         key = visualize_processing(
-                            frame, masked_frame, enhanced, fg_mask, edges, fish_vis,
+                            frame, masked_frame, enhanced, None, None, fish_vis,
                             current_center, previous_center, distance, instantaneous_speed,
                             not is_showing_previous, is_outside_tank, is_showing_previous
                         )
@@ -661,7 +677,7 @@ def main():
                 previous_center = current_center
 
                 contour_areas = []
-                for idx, contour in enumerate(valid_contours):
+                for idx, contour in enumerate(contours):
                     area = cv2.contourArea(contour)
                     contour_areas.append(area)
                     M = cv2.moments(contour)
@@ -670,7 +686,7 @@ def main():
                         center_y = int(M["m01"] / M["m00"])
                         write_center_data(center_writer, frame_count, idx, center_x, center_y, instantaneous_speed)
 
-                draw_fish_contours(enhanced, valid_contours, list(box_data.values()), time_spent, original_fps, contour_areas=contour_areas)
+                draw_fish_contours(enhanced, contours, list(box_data.values()), time_spent, original_fps, contour_areas=contour_areas)
 
                 pbar.update(1)
                 frame_count += 1
