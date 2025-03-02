@@ -11,7 +11,7 @@ from box_manager import BoxManager
 # Constants
 MAX_DISTANCE_THRESHOLD = 150 
 PIXEL_TO_METER = 0.000099  
-VISUALIZATION_FRAME_SKIP = 5  # Increase to skip more frames for faster visualization
+VISUALIZATION_FRAME_SKIP = 5  
 
 
 def define_boxes(video_path, original_fps=30, slowed_fps=10, config_file=None):
@@ -130,7 +130,7 @@ def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     """
     Preprocesses a single video frame.
 
-    Includes resizing, grayscale conversion, brightness adjustment, Gaussian blur, and CLAHE enhancement.
+    Includes resizing, grayscale conversion, brightness adjustment, Gaussian blur, sharpening, and CLAHE enhancement.
 
     Args:
         frame (np.array): Input video frame.
@@ -147,7 +147,14 @@ def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.add(gray, brightness_increase)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    enhanced = clahe.apply(blurred)
+    
+    # Apply sharpening
+    sharpening_kernel = np.array([[-1, -1, -1],
+                                  [-1,  9, -1],
+                                  [-1, -1, -1]])
+    sharpened = cv2.filter2D(blurred, -1, sharpening_kernel)
+    
+    enhanced = clahe.apply(sharpened)
 
     return enhanced, scale_factor
 
@@ -461,7 +468,7 @@ def main():
     and saves the results to CSV files.
     """
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n1.mov"
+    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n20a.mov"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
@@ -517,6 +524,12 @@ def main():
             brightness_increase = 39
             contrast_clip_limit = 0.85
             min_contour_area = 15
+            sharpening_strength = 9  # Can be adjusted from 5 (mild) to 15 (strong)
+            
+            # Then create the kernel dynamically:
+            sharpening_kernel = np.array([[-1, -1, -1],
+                                         [-1, sharpening_strength, -1],
+                                         [-1, -1, -1]])
 
             clahe = cv2.createCLAHE(clipLimit=contrast_clip_limit, tileGridSize=(8,8))
             bg_subtractor = cv2.createBackgroundSubtractorKNN(history=1000, dist2Threshold=400.0, detectShadows=True)
@@ -576,7 +589,11 @@ def main():
                 gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
                 gray = cv2.add(gray, brightness_increase)
                 blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-                enhanced = clahe.apply(blurred)
+                
+                # Apply sharpening
+                sharpened = cv2.filter2D(blurred, -1, sharpening_kernel)
+                
+                enhanced = clahe.apply(sharpened)
 
                 fg_mask = bg_subtractor.apply(enhanced)
                 fg_mask = cv2.bitwise_and(fg_mask, tank_mask)
