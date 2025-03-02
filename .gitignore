@@ -4,3 +4,4 @@ crop_video.py
 Utilities/*
 
 
+__pycache__/*
