@@ -31,7 +31,7 @@ def define_boxes(video_path, original_fps=30, slowed_fps=10, config_file=None):
     Args:
         video_path (str): Path to the video file.
         original_fps (int, optional): Original frames per second of the video. Defaults to 30.
-        slowed_fps (int, optional): Slowed frames per second for processing (not currently used). Defaults to 10.
+        slowed_fps (int, optional): Slowed frames per second for processing. Defaults to 10.
         config_file (str, optional): Path to a configuration file to load existing boxes. Defaults to None.
 
     Returns:
@@ -130,7 +130,8 @@ def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     """
     Preprocesses a single video frame.
 
-    Includes resizing, grayscale conversion, brightness adjustment, Gaussian blur, sharpening, and CLAHE enhancement.
+    Includes resizing, grayscale conversion, brightness adjustment, Gaussian blur, 
+    sharpening, and CLAHE enhancement.
 
     Args:
         frame (np.array): Input video frame.
@@ -148,7 +149,6 @@ def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     gray = cv2.add(gray, brightness_increase)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Apply sharpening
     sharpening_kernel = np.array([[-1, -1, -1],
                                   [-1,  9, -1],
                                   [-1, -1, -1]])
@@ -199,7 +199,8 @@ def process_frame(frame, bg_subtractor, clahe, brightness_increase, scale_factor
         scale_factor (float): Frame scaling factor.
 
     Returns:
-        tuple: Enhanced frame, detected contours, and center of the largest contour if found, otherwise None for center.
+        tuple: Enhanced frame, detected contours, and center of the largest contour if found, 
+               otherwise None for center.
     """
     enhanced, _ = preprocess_frame(frame, brightness_increase, clahe, scale_factor)
     contours = detect_fish(enhanced, bg_subtractor)
@@ -221,7 +222,7 @@ def is_contour_in_box(contour, box):
     Args:
         contour (np.array): Contour points.
         box (dict): A dictionary with box information,
-                     where "coords" is a list of four corner tuples.
+                   where "coords" is a list of four corner tuples.
 
     Returns:
         bool: True if the contour's center is within the box, False otherwise.
@@ -235,19 +236,24 @@ def is_contour_in_box(contour, box):
         return cv2.pointPolygonTest(pts, (cx, cy), False) >= 0
     return False
 
-def draw_fish_contours(enhanced, contours, boxes, time_spent, original_fps, contour_areas=None):
+def draw_fish_contours(enhanced, contours, boxes, time_spent, distance_in_box, prev_box_positions, 
+                      original_fps, current_frame, contour_areas=None):
     """
-    Draws contours on the frame and updates time spent in each box.
+    Draws contours on the frame and updates time spent and distance in each box.
 
     Args:
         enhanced (np.array): Frame to draw contours on.
         contours (list): List of contours to draw.
         boxes (list): List of box dictionaries.
         time_spent (list): List to store time spent in each box.
+        distance_in_box (list): List to store total distance traveled in each box.
+        prev_box_positions (list): List to store previous positions in each box.
         original_fps (float): Original frames per second of the video.
+        current_frame (int): Current frame number.
         contour_areas (list, optional): Pre-calculated contour areas. Defaults to None.
     """
     detected_boxes = [False] * len(boxes)
+    current_box_positions = [None] * len(boxes)
 
     for i, contour in enumerate(contours):
         if contour.dtype != np.int32:
@@ -261,13 +267,34 @@ def draw_fish_contours(enhanced, contours, boxes, time_spent, original_fps, cont
         cv2.rectangle(enhanced, (x, y), (x + w, y + h), (255, 255, 255), 2)
         cv2.drawContours(enhanced, [contour], -1, (255, 255, 255), 1)
 
-        for j, box in enumerate(boxes):
-            if is_contour_in_box(contour, box):
-                detected_boxes[j] = True
+        M = cv2.moments(contour)
+        if M["m00"] != 0:
+            center_x = int(M["m10"] / M["m00"])
+            center_y = int(M["m01"] / M["m00"])
+            current_center = (center_x, center_y)
+            
+            for j, box in enumerate(boxes):
+                if is_contour_in_box(contour, box):
+                    detected_boxes[j] = True
+                    current_box_positions[j] = current_center
+                    
+                    # Calculate distance traveled within the box
+                    if prev_box_positions[j] is not None:
+                        dx = current_center[0] - prev_box_positions[j][0]
+                        dy = current_center[1] - prev_box_positions[j][1]
+                        distance = np.sqrt(dx**2 + dy**2)
+                        
+                        # Filter out unreasonable movements
+                        if distance <= MAX_DISTANCE_THRESHOLD:
+                            distance_in_box[j] += distance * PIXEL_TO_METER
 
     for i, detected in enumerate(detected_boxes):
         if detected:
             time_spent[i] += 1 / original_fps
+            prev_box_positions[i] = current_box_positions[i]
+        else:
+            # Reset previous position if fish is no longer in the box
+            prev_box_positions[i] = None
 
 def log_video_info(cap):
     """
@@ -286,20 +313,18 @@ def handle_key_press(key):
     """
     Handles key press events for controlling video processing.
 
-    Currently, only 'q' key is handled to quit the program.
-
     Args:
         key (int): Key code of the pressed key.
 
     Returns:
-        bool: True if a handled key was pressed, False otherwise. Currently always returns False.
+        bool: True if a handled key was pressed, False otherwise.
     """
     if key == ord('q'):
         print("Quit key pressed. Exiting...")
         sys.exit()
     return False
 
-def write_center_data(center_writer, frame_count, idx, center_x, center_y, instantaneous_speed):
+def write_center_data(center_writer, frame_count, idx, center_x, center_y, speed):
     """
     Write the center data to the CSV file.
 
@@ -309,9 +334,9 @@ def write_center_data(center_writer, frame_count, idx, center_x, center_y, insta
         idx (int): Contour index.
         center_x (int): X-coordinate of the center.
         center_y (int): Y-coordinate of the center.
-        instantaneous_speed (float): Calculated instantaneous speed in m/s.
+        speed (float): Calculated speed in m/s.
     """
-    center_writer.writerow([frame_count, idx, center_x, center_y, instantaneous_speed])
+    center_writer.writerow([frame_count, idx, center_x, center_y, speed])
 
 def create_tank_mask(frame, points=None):
     """
@@ -322,10 +347,11 @@ def create_tank_mask(frame, points=None):
 
     Args:
         frame (np.array): Input video frame.
-        points (list, optional): List of points defining the tank boundary. If None, user must select points. Defaults to None.
+        points (list, optional): List of points defining the tank boundary. Defaults to None.
 
     Returns:
-        tuple: Binary mask where tank area is white (255) and outside area is black (0), and the list of points defining the mask.
+        tuple: Binary mask where tank area is white (255) and outside area is black (0),
+               and the list of points defining the mask.
     """
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
 
@@ -361,7 +387,8 @@ def create_tank_mask(frame, points=None):
     return mask, points
 
 def apply_tank_mask(frame, mask):
-    """Apply tank mask to the frame.
+    """
+    Apply tank mask to the frame.
 
     Args:
         frame (np.array): Input frame.
@@ -376,9 +403,6 @@ def is_fish_movement_valid(current_center, previous_center, previous_valid_cente
     """
     Check if fish movement is valid based on distance and consistency.
 
-    If the movement distance exceeds max_distance, the movement is considered invalid,
-    and the function returns the previous valid center.
-
     Args:
         current_center (tuple): Current detected position (x, y).
         previous_center (tuple): Position from the previous frame (x, y).
@@ -387,8 +411,7 @@ def is_fish_movement_valid(current_center, previous_center, previous_valid_cente
 
     Returns:
         tuple: Tuple of (is_valid, center_to_use), where is_valid is a boolean indicating
-               if the movement is valid, and center_to_use is the center to be used
-               (current_center if valid, previous_valid_center if invalid).
+               if the movement is valid, and center_to_use is the center to be used.
     """
     if previous_center is None:
         return True, current_center
@@ -404,12 +427,10 @@ def is_fish_movement_valid(current_center, previous_center, previous_valid_cente
 
 def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, current_center, previous_center,
                        distance=None, instantaneous_speed=None, is_valid_movement=True,
-                       is_outside_tank=False, is_showing_previous=False):
+                       is_outside_tank=False, is_showing_previous=False, reflection_detected=False, 
+                       status_text=None, cumulative_speed=None, window_size=1.0):
     """
     Visualize the processing steps in separate windows.
-
-    Displays original frame, masked frame, enhanced frame, background subtraction mask,
-    edge detection result, and fish visualization with contours, boxes, and tracking information.
 
     Args:
         original (np.array): Original frame.
@@ -425,6 +446,10 @@ def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, c
         is_valid_movement (bool, optional): Whether movement is valid. Defaults to True.
         is_outside_tank (bool, optional): Whether detection is outside tank. Defaults to False.
         is_showing_previous (bool, optional): Whether using previous position. Defaults to False.
+        reflection_detected (bool, optional): Whether reflection was detected. Defaults to False.
+        status_text (str, optional): Status text to display on visualization. Defaults to None.
+        cumulative_speed (float, optional): Speed calculated over a window of frames.
+        window_size (float, optional): Size of the window in seconds.
 
     Returns:
         int: Key pressed by user (for handling quit).
@@ -439,7 +464,11 @@ def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, c
         cv2.line(fish_vis, previous_center, current_center, (255, 255, 0), 2)
 
     if current_center:
-        if is_outside_tank:
+        if reflection_detected:
+            cv2.circle(fish_vis, current_center, 8, (0, 255, 255), -1)  # Yellow for reflection
+            cv2.putText(fish_vis, "Reflection detected", (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        elif is_outside_tank:
             cv2.circle(fish_vis, current_center, 8, (0, 0, 255), -1)
             cv2.putText(fish_vis, "Detection outside tank", (10, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -450,14 +479,68 @@ def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, c
         else:
             cv2.circle(fish_vis, current_center, 5, (255, 0, 0), -1)
 
-    if instantaneous_speed is not None:
-        speed_text = f"Speed: {instantaneous_speed:.4f} m/s"
+    # Only show cumulative speed (remove instantaneous speed display)
+    if cumulative_speed is not None:
+        speed_text = f"Avg Speed ({window_size:.1f}s): {cumulative_speed:.4f} m/s"
         cv2.putText(fish_vis, speed_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
+    if status_text:
+        cv2.putText(fish_vis, status_text, (10, 150),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
     cv2.imshow("Detected Fish", fish_vis)
 
     return cv2.waitKey(1) & 0xFF
+
+def is_reflection(frame, center, tolerance=10):
+    """
+    Check if a detected point is likely a reflection based on RGB values.
+    
+    When RGB values are very close to each other, it often indicates a white/gray reflection.
+    
+    Args:
+        frame (np.array): Original color frame.
+        center (tuple): Center coordinates (x, y) to check.
+        tolerance (int, optional): Maximum allowed difference between RGB channels. Defaults to 10.
+        
+    Returns:
+        bool: True if likely a reflection, False otherwise.
+    """
+    try:
+        # Check if center coordinates are valid
+        if center is None:
+            return False
+            
+        x, y = center
+        height, width = frame.shape[:2]
+        
+        # Boundary check
+        if not (0 <= x < width and 0 <= y < height):
+            return False
+            
+        # Check if frame has 3 channels (BGR)
+        if len(frame.shape) != 3:
+            return False
+            
+        # Safely extract BGR values
+        b = int(frame[y, x, 0])
+        g = int(frame[y, x, 1])
+        r = int(frame[y, x, 2])
+        
+        # Ensure values are within valid range (0-255)
+        b = max(0, min(b, 255))
+        g = max(0, min(g, 255))
+        r = max(0, min(r, 255))
+        
+        # Check if RGB values are within tolerance of each other
+        return (abs(r - g) <= tolerance and 
+                abs(r - b) <= tolerance and 
+                abs(g - b) <= tolerance)
+                
+    except Exception as e:
+        print(f"Warning: Error in reflection detection: {e}")
+        return False
 
 def main():
     """
@@ -468,7 +551,7 @@ def main():
     and saves the results to CSV files.
     """
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n20a.mov"
+    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
@@ -512,21 +595,21 @@ def main():
     data_filename = os.path.join(output_dir, f"fish_data_{video_filename}.csv")
     with open(data_filename, 'w', newline='') as data_file:
         data_writer = csv.writer(data_file)
-        data_writer.writerow(["box_name", "time_spent (s)", "average_speed (m/s)"])
+        data_writer.writerow(["box_name", "time_spent (s)", "distance_traveled (m)", "average_speed (m/s)"])
 
         center_filename = os.path.join(output_dir, f"fish_coords_{video_filename}.csv")
         with open(center_filename, 'w', newline='') as center_file:
             center_writer = csv.writer(center_file)
-            center_writer.writerow(["frame", "contour_id", "center_x (px)", "center_y (px)", "instantaneous_speed (m/s)"])
+            center_writer.writerow(["frame", "contour_id", "center_x (px)", "center_y (px)", 
+                                     "speed (m/s)"])
 
             frame_skip = 1
             scale_factor = 1.0
             brightness_increase = 39
             contrast_clip_limit = 0.85
-            min_contour_area = 15
-            sharpening_strength = 9  # Can be adjusted from 5 (mild) to 15 (strong)
+            min_contour_area = 20
+            sharpening_strength = 9
             
-            # Then create the kernel dynamically:
             sharpening_kernel = np.array([[-1, -1, -1],
                                          [-1, sharpening_strength, -1],
                                          [-1, -1, -1]])
@@ -538,6 +621,8 @@ def main():
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             original_fps = cap.get(cv2.CAP_PROP_FPS)
             time_spent = [0] * len(box_data)
+            distance_in_box = [0] * len(box_data)
+            prev_box_positions = [None] * len(box_data)
 
             max_frames = min(9000, total_frames)
             pbar = tqdm(total=max_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
@@ -545,7 +630,10 @@ def main():
             previous_center = None
             total_speed = 0
             speed_count = 0
-            visualization_frame_count = 0 # Counter for visualization frame skipping
+            visualization_frame_count = 0
+
+            position_history = []  # Will store (frame_num, x, y) tuples
+            speed_window_size = int(original_fps)  # Use 1 second window (adjust as needed)
 
             ret, first_frame = cap.read()
             if not ret:
@@ -573,6 +661,7 @@ def main():
                 cv2.resizeWindow("Detected Fish", 640, 480)
 
             previous_valid_center = None
+            previous_valid_contour = None
 
             while True:
                 ret, frame = cap.read()
@@ -590,7 +679,6 @@ def main():
                 gray = cv2.add(gray, brightness_increase)
                 blurred = cv2.GaussianBlur(gray, (5, 5), 0)
                 
-                # Apply sharpening
                 sharpened = cv2.filter2D(blurred, -1, sharpening_kernel)
                 
                 enhanced = clahe.apply(sharpened)
@@ -617,63 +705,122 @@ def main():
                     fish_vis = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
                     cv2.drawContours(fish_vis, valid_contours, -1, (0, 255, 0), 2)
 
-                    for box in box_data.values():
+                    for i, box in enumerate(box_data.values()):
                         pts = np.array(box["coords"], dtype=np.int32).reshape((-1, 1, 2))
                         cv2.polylines(fish_vis, [pts], True, (0, 0, 255), 2)
+                        
+                        # Add box number and speed
+                        center_x = int(np.mean([pt[0] for pt in box["coords"]]))
+                        center_y = int(np.mean([pt[1] for pt in box["coords"]]))
+                        
+                        # Calculate current average speed in the box
+                        if time_spent[i] > 0:
+                            avg_speed = distance_in_box[i] / time_spent[i]
+                            box_text = f"Box {i+1}: {avg_speed:.4f} m/s"
+                            cv2.putText(fish_vis, box_text, (center_x, center_y), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
                 current_center = None
+                current_contour = None
                 is_outside_tank = False
                 is_showing_previous = False
+                is_reflection_detected = False
 
                 if valid_contours:
                     largest_contour = max(valid_contours, key=cv2.contourArea)
+                    current_contour = largest_contour
                     M = cv2.moments(largest_contour)
                     if M["m00"] != 0:
                         center_x = int(M["m10"] / M["m00"])
                         center_y = int(M["m01"] / M["m00"])
                         current_center = (center_x, center_y)
 
-                        if center_y < tank_mask.shape[0] and center_x < tank_mask.shape[1] and tank_mask[center_y, center_x] > 0:
-                            is_valid_movement, center_to_use = is_fish_movement_valid(
-                                current_center,
-                                previous_center,
-                                previous_valid_center if previous_valid_center else current_center,
-                                MAX_DISTANCE_THRESHOLD
-                            )
+                        if is_reflection(frame, current_center):
+                            is_reflection_detected = True
+                            if previous_valid_contour is not None:
+                                current_contour = previous_valid_contour
+                                M = cv2.moments(previous_valid_contour)
+                                if M["m00"] != 0:
+                                    center_x = int(M["m10"] / M["m00"])
+                                    center_y = int(M["m01"] / M["m00"])
+                                    current_center = (center_x, center_y)
+                                    is_showing_previous = True
 
-                            if is_valid_movement:
-                                previous_valid_center = current_center
+                        if not is_reflection_detected:
+                            if center_y < tank_mask.shape[0] and center_x < tank_mask.shape[1] and tank_mask[center_y, center_x] > 0:
+                                is_valid_movement, center_to_use = is_fish_movement_valid(
+                                    current_center,
+                                    previous_center,
+                                    previous_valid_center if previous_valid_center else current_center,
+                                    MAX_DISTANCE_THRESHOLD
+                                )
+
+                                if is_valid_movement:
+                                    previous_valid_center = current_center
+                                    previous_valid_contour = current_contour
+                                else:
+                                    current_center = center_to_use
+                                    current_contour = previous_valid_contour if previous_valid_contour is not None else current_contour
+                                    is_showing_previous = True
                             else:
-                                current_center = center_to_use
-                                is_showing_previous = True
-                        else:
-                            is_outside_tank = True
-                            current_center = previous_valid_center
+                                is_outside_tank = True
+                                current_center = previous_valid_center
+                                current_contour = previous_valid_contour if previous_valid_contour is not None else current_contour
 
-                instantaneous_speed = 0
                 distance = None
+                cumulative_speed = 0
 
                 if current_center and previous_center:
                     dx = current_center[0] - previous_center[0]
                     dy = current_center[1] - previous_center[1]
                     distance = np.sqrt(dx**2 + dy**2)
 
-                    if distance <= MAX_DISTANCE_THRESHOLD:
-                        instantaneous_speed = distance * original_fps * PIXEL_TO_METER
-                        total_speed += instantaneous_speed
-                        speed_count += 1
-
+                    # Store current position with frame number
+                    position_history.append((frame_count, current_center[0], current_center[1]))
+                    
+                    # Remove positions older than the window size
+                    while len(position_history) > 0 and position_history[0][0] < frame_count - speed_window_size:
+                        position_history.pop(0)
+                    
+                    # Calculate cumulative distance if we have enough positions
+                    if len(position_history) > 1:
+                        cumulative_distance = 0
+                        for i in range(1, len(position_history)):
+                            prev_pos = position_history[i-1]
+                            curr_pos = position_history[i]
+                            
+                            # Calculate distance between consecutive positions
+                            pos_dx = curr_pos[1] - prev_pos[1]
+                            pos_dy = curr_pos[2] - prev_pos[2]
+                            pos_dist = np.sqrt(pos_dx**2 + pos_dy**2)
+                            
+                            cumulative_distance += pos_dist
+                        
+                        # Calculate speed based on cumulative distance
+                        window_time = (position_history[-1][0] - position_history[0][0]) / original_fps
+                        if window_time > 0:  # Avoid division by zero
+                            cumulative_speed = cumulative_distance * PIXEL_TO_METER / window_time
+            
                 if enable_visualization:
-                    # Visualize only every VISUALIZATION_FRAME_SKIP frames
                     if visualization_frame_count % VISUALIZATION_FRAME_SKIP == 0:
+                        status_text = ""
+                        if is_reflection_detected:
+                            status_text = "Reflection detected"
+                        elif is_outside_tank:
+                            status_text = "Detection outside tank"
+                        elif is_showing_previous:
+                            status_text = "Using previous position"
+                        
                         key = visualize_processing(
                             frame, masked_frame, enhanced, fg_mask, edges, fish_vis,
-                            current_center, previous_center, distance, instantaneous_speed,
-                            not is_showing_previous, is_outside_tank, is_showing_previous
+                            current_center, previous_center, distance, None,  # Pass None for instantaneous_speed
+                            not is_showing_previous, is_outside_tank, is_showing_previous,
+                            reflection_detected=is_reflection_detected, status_text=status_text,
+                            cumulative_speed=cumulative_speed, window_size=speed_window_size/original_fps
                         )
                         if key == ord('q'):
                             break
-                    visualization_frame_count += 1 # Increment visualization frame counter
+                    visualization_frame_count += 1
 
                 previous_center = current_center
 
@@ -685,9 +832,12 @@ def main():
                     if M["m00"] != 0:
                         center_x = int(M["m10"] / M["m00"])
                         center_y = int(M["m01"] / M["m00"])
-                        write_center_data(center_writer, frame_count, idx, center_x, center_y, instantaneous_speed)
+                        # Just use cumulative speed
+                        write_center_data(center_writer, frame_count, idx, center_x, center_y, cumulative_speed)
 
-                draw_fish_contours(enhanced, valid_contours, list(box_data.values()), time_spent, original_fps, contour_areas=contour_areas)
+                draw_fish_contours(enhanced, valid_contours, list(box_data.values()), 
+                                  time_spent, distance_in_box, prev_box_positions, 
+                                  original_fps, frame_count, contour_areas=contour_areas)
 
                 pbar.update(1)
                 frame_count += 1
@@ -699,8 +849,15 @@ def main():
 
             for i, (box_name, box_info) in enumerate(box_data.items()):
                 box_info["time"] = time_spent[i]
-                average_speed = total_speed / speed_count if speed_count > 0 else 0
-                data_writer.writerow([box_name, time_spent[i], average_speed])
+                box_info["distance"] = distance_in_box[i]
+                
+                # Calculate average speed in box
+                if time_spent[i] > 0:
+                    avg_speed_in_box = distance_in_box[i] / time_spent[i]
+                else:
+                    avg_speed_in_box = 0
+                
+                data_writer.writerow([box_name, time_spent[i], distance_in_box[i], avg_speed_in_box])
 
 if __name__ == "__main__":
     main()
