@@ -7,11 +7,13 @@ from tqdm import tqdm
 import json
 import yaml
 from box_manager import BoxManager
+import tkinter as tk
+from tkinter import messagebox
 
 # Constants
 MAX_DISTANCE_THRESHOLD = 150 
 PIXEL_TO_METER = 0.000099  
-VISUALIZATION_FRAME_SKIP = 5  
+VISUALIZATION_FRAME_SKIP = 15 
 
 
 def define_boxes(video_path, original_fps=30, slowed_fps=10, config_file=None):
@@ -379,10 +381,10 @@ def create_tank_mask(frame, points=None):
                 break
 
         cv2.destroyWindow("Define Tank Area")
-
-    if len(points) > 2:
-        pts = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.fillPoly(mask, [pts], 255)
+    else:
+        if len(points) > 2:
+            pts = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask, [pts], 255)
 
     return mask, points
 
@@ -542,6 +544,12 @@ def is_reflection(frame, center, tolerance=10):
         print(f"Warning: Error in reflection detection: {e}")
         return False
 
+def show_error(message):
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    messagebox.showerror("Error", message)
+    root.destroy()
+
 def main():
     """
     Main function to execute fish tracking and analysis.
@@ -551,7 +559,7 @@ def main():
     and saves the results to CSV files.
     """
     print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/"
+    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n6e.mov"
     check_video_path(path)
     cap = initialize_video_capture(path)
     log_video_info(cap)
@@ -559,9 +567,25 @@ def main():
     enable_visualization = input("Enable visualization? (y/n): ").strip().lower() == 'y'
 
     box_manager = BoxManager()
-    user_choice = input("Would you like to (d)raw boxes or provide (c)oordinates? (d/c): ").strip().lower()
+    user_choice = input("Would you like to (d)raw boxes, provide (c)oordinates, or load tank (j)son? (d/c/j): ").strip().lower()
 
-    if user_choice == 'c':
+    tank_points = None  # Initialize tank_points to None
+    
+    if user_choice == 'j':
+        json_file = input("Enter the path to the JSON file with box and tank coordinates: ").strip()
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+                tank_points = data.get("tank_coordinates", [])
+                if not tank_points:
+                    show_error("Error: No tank coordinates found in the JSON file.")
+                    return
+                # Load box data if needed
+                box_data = {key: value for key, value in data.items() if key != "tank_coordinates"}
+        except Exception as e:
+            show_error(f"Error loading JSON file: {e}")
+            return
+    elif user_choice == 'c':
         num_boxes = int(input("Enter the number of boxes you want to define: "))
         for i in range(num_boxes):
             print(f"Enter coordinates for Box {i+1} (format: x1,y1 x2,y2 x3,y3 x4,y4):")
@@ -640,7 +664,8 @@ def main():
                 print("Error: Cannot read the first frame.")
                 sys.exit(1)
 
-            tank_mask, tank_points = create_tank_mask(first_frame)
+            # Use tank_points from JSON if available, otherwise prompt user
+            tank_mask, tank_points = create_tank_mask(first_frame, points=tank_points)
             print(f"Tank boundary defined with {len(tank_points)} points")
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
