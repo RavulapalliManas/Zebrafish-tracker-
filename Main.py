@@ -9,12 +9,192 @@ import yaml
 from box_manager import BoxManager
 import tkinter as tk
 from tkinter import messagebox
+import shutil
+import time
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import io
+import requests
+from office365.runtime.auth.authentication_context import AuthenticationContext
+from office365.sharepoint.client_context import ClientContext
+from office365.sharepoint.files.file import File
 
 # Constants
 MAX_DISTANCE_THRESHOLD = 150 
 PIXEL_TO_METER = 0.000099  
 VISUALIZATION_FRAME_SKIP = 15 
 
+def download_from_google_drive(file_id, destination):
+    """
+    Download a file from Google Drive.
+    
+    Args:
+        file_id (str): The ID of the file to download.
+        destination (str): The path where the file will be saved.
+    
+    Returns:
+        bool: True if download was successful, False otherwise.
+    """
+    try:
+        # Load credentials from a file or environment
+        creds = Credentials.from_authorized_user_info(json.loads(os.environ.get('GOOGLE_CREDENTIALS')))
+        
+        # Build the Drive API client
+        service = build('drive', 'v3', credentials=creds)
+        
+        # Create a BytesIO object to store the downloaded file
+        request = service.files().get_media(fileId=file_id)
+        file_handle = io.BytesIO()
+        downloader = MediaIoBaseDownload(file_handle, request)
+        
+        # Download the file
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            print(f"Download {int(status.progress() * 100)}%")
+        
+        # Save the file to the destination
+        with open(destination, 'wb') as f:
+            f.write(file_handle.getvalue())
+            
+        return True
+    except Exception as e:
+        print(f"Error downloading from Google Drive: {e}")
+        return False
+
+def download_from_onedrive(file_url, destination):
+    """
+    Download a file from OneDrive.
+    
+    Args:
+        file_url (str): The URL of the file to download.
+        destination (str): The path where the file will be saved.
+    
+    Returns:
+        bool: True if download was successful, False otherwise.
+    """
+    try:
+        # Get credentials from environment variables
+        username = os.environ.get('ONEDRIVE_USERNAME')
+        password = os.environ.get('ONEDRIVE_PASSWORD')
+        site_url = os.environ.get('ONEDRIVE_SITE_URL')
+        
+        # Authenticate
+        ctx_auth = AuthenticationContext(site_url)
+        ctx_auth.acquire_token_for_user(username, password)
+        ctx = ClientContext(site_url, ctx_auth)
+        
+        # Download the file
+        response = File.open_binary(ctx, file_url)
+        
+        # Save the file to the destination
+        with open(destination, 'wb') as f:
+            f.write(response.content)
+            
+        return True
+    except Exception as e:
+        print(f"Error downloading from OneDrive: {e}")
+        return False
+
+def get_video_files_from_google_drive(folder_id):
+    """
+    Get a list of video files from a Google Drive folder.
+    
+    Args:
+        folder_id (str): The ID of the folder to search.
+    
+    Returns:
+        list: A list of dictionaries containing file IDs and names.
+    """
+    try:
+        # Load credentials from a file or environment
+        creds = Credentials.from_authorized_user_info(json.loads(os.environ.get('GOOGLE_CREDENTIALS')))
+        
+        # Build the Drive API client
+        service = build('drive', 'v3', credentials=creds)
+        
+        # Query for video files in the folder
+        query = f"'{folder_id}' in parents and (mimeType contains 'video/')"
+        results = service.files().list(q=query, fields="files(id, name)").execute()
+        
+        return results.get('files', [])
+    except Exception as e:
+        print(f"Error getting files from Google Drive: {e}")
+        return []
+
+def get_video_files_from_onedrive(folder_url):
+    """
+    Get a list of video files from a OneDrive folder.
+    
+    Args:
+        folder_url (str): The URL of the folder to search.
+    
+    Returns:
+        list: A list of dictionaries containing file URLs and names.
+    """
+    try:
+        # Get credentials from environment variables
+        username = os.environ.get('ONEDRIVE_USERNAME')
+        password = os.environ.get('ONEDRIVE_PASSWORD')
+        site_url = os.environ.get('ONEDRIVE_SITE_URL')
+        
+        # Authenticate
+        ctx_auth = AuthenticationContext(site_url)
+        ctx_auth.acquire_token_for_user(username, password)
+        ctx = ClientContext(site_url, ctx_auth)
+        
+        # Get files from the folder
+        folder = ctx.web.get_folder_by_server_relative_url(folder_url)
+        files = folder.files
+        ctx.load(files)
+        ctx.execute_query()
+        
+        # Filter for video files
+        video_extensions = ['.mp4', '.mov', '.avi', '.wmv', '.mkv']
+        video_files = []
+        
+        for file in files:
+            file_name = file.properties['Name']
+            file_ext = os.path.splitext(file_name)[1].lower()
+            if file_ext in video_extensions:
+                video_files.append({
+                    'url': file.properties['ServerRelativeUrl'],
+                    'name': file_name
+                })
+        
+        return video_files
+    except Exception as e:
+        print(f"Error getting files from OneDrive: {e}")
+        return []
+
+def get_local_video_files(folder_path):
+    """
+    Get a list of video files from a local folder.
+    
+    Args:
+        folder_path (str): The path to the folder to search.
+    
+    Returns:
+        list: A list of dictionaries containing file paths and names.
+    """
+    video_extensions = ['.mp4', '.mov', '.avi', '.wmv', '.mkv']
+    video_files = []
+    
+    try:
+        for file_name in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, file_name)
+            if os.path.isfile(file_path):
+                file_ext = os.path.splitext(file_name)[1].lower()
+                if file_ext in video_extensions:
+                    video_files.append({
+                        'path': file_path,
+                        'name': file_name
+                    })
+        return video_files
+    except Exception as e:
+        print(f"Error getting local video files: {e}")
+        return []
 
 def define_boxes(video_path, original_fps=30, slowed_fps=10, config_file=None):
     """
@@ -550,78 +730,81 @@ def show_error(message):
     messagebox.showerror("Error", message)
     root.destroy()
 
-def main():
+def process_video(video_path, output_dir, box_data=None, tank_points=None, enable_visualization=False):
     """
-    Main function to execute fish tracking and analysis.
-
-    Sets up video processing, handles user input for box definition and visualization,
-    processes each frame to detect fish, calculates time spent in boxes and speed,
-    and saves the results to CSV files.
+    Process a single video file for fish tracking.
+    
+    Args:
+        video_path (str): Path to the video file.
+        output_dir (str): Directory to save output files.
+        box_data (dict, optional): Box data to use for processing. If None, user will be prompted.
+        tank_points (list, optional): Tank boundary points. If None, user will be prompted.
+        enable_visualization (bool, optional): Whether to enable visualization. Defaults to False.
+        
+    Returns:
+        tuple: Box data and tank points used for processing.
     """
-    print("Starting video processing...")
-    path = "/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Vid/originals/n6e.mov"
-    check_video_path(path)
-    cap = initialize_video_capture(path)
+    check_video_path(video_path)
+    cap = initialize_video_capture(video_path)
     log_video_info(cap)
 
-    enable_visualization = input("Enable visualization? (y/n): ").strip().lower() == 'y'
-
     box_manager = BoxManager()
-    user_choice = input("Would you like to (d)raw boxes, provide (c)oordinates, or load tank (j)son? (d/c/j): ").strip().lower()
-
-    tank_points = None  # Initialize tank_points to None
     
-    if user_choice == 'j':
-        json_file = input("Enter the path to the JSON file with box and tank coordinates: ").strip()
-        try:
-            with open(json_file, 'r') as f:
-                data = json.load(f)
-                tank_points = data.get("tank_coordinates", [])
-                if not tank_points:
-                    show_error("Error: No tank coordinates found in the JSON file.")
-                    return
-                # Load box data if needed
-                box_data = {key: value for key, value in data.items() if key != "tank_coordinates"}
-        except Exception as e:
-            show_error(f"Error loading JSON file: {e}")
-            return
-    elif user_choice == 'c':
-        num_boxes = int(input("Enter the number of boxes you want to define: "))
-        for i in range(num_boxes):
-            print(f"Enter coordinates for Box {i+1} (format: x1,y1 x2,y2 x3,y3 x4,y4):")
-            coords_input = input().strip()
+    # If box_data is not provided, prompt user to define boxes
+    if box_data is None:
+        user_choice = input("Would you like to (d)raw boxes, provide (c)oordinates, or load tank (j)son? (d/c/j): ").strip().lower()
+        
+        if user_choice == 'j':
+            json_file = input("Enter the path to the JSON file with box and tank coordinates: ").strip()
             try:
-                coordinates = [tuple(map(int, point.split(','))) for point in coords_input.split()]
-                if len(coordinates) != 4:
-                    print(f"Error: You must provide exactly 4 points for Box {i+1}. Got {len(coordinates)}.")
-                    continue
-                box_manager.add_box_from_coordinates(coordinates, label=f"User Box {i+1}")
-            except ValueError:
-                print("Invalid input format. Please enter coordinates as x,y pairs separated by spaces.")
-                return
-        box_data = box_manager.get_box_data()
-    else:
-        box_data = define_boxes(path)
+                with open(json_file, 'r') as f:
+                    data = json.load(f)
+                    tank_points = data.get("tank_coordinates", [])
+                    if not tank_points:
+                        show_error("Error: No tank coordinates found in the JSON file.")
+                        return None, None
+                    # Load box data if needed
+                    box_data = {key: value for key, value in data.items() if key != "tank_coordinates"}
+            except Exception as e:
+                show_error(f"Error loading JSON file: {e}")
+                return None, None
+        elif user_choice == 'c':
+            num_boxes = int(input("Enter the number of boxes you want to define: "))
+            for i in range(num_boxes):
+                print(f"Enter coordinates for Box {i+1} (format: x1,y1 x2,y2 x3,y3 x4,y4):")
+                coords_input = input().strip()
+                try:
+                    coordinates = [tuple(map(int, point.split(','))) for point in coords_input.split()]
+                    if len(coordinates) != 4:
+                        print(f"Error: You must provide exactly 4 points for Box {i+1}. Got {len(coordinates)}.")
+                        continue
+                    box_manager.add_box_from_coordinates(coordinates, label=f"User Box {i+1}")
+                except ValueError:
+                    print("Invalid input format. Please enter coordinates as x,y pairs separated by spaces.")
+                    return None, None
+            box_data = box_manager.get_box_data()
+        else:
+            box_data = define_boxes(video_path)
 
-    print("User-defined boxes:", box_data)
+    print("Using boxes:", box_data)
 
-    video_filename = os.path.splitext(os.path.basename(path))[0]
-    output_dir = f"/Users/manasvenkatasairavulapalli/Desktop/Research Work/ml/Data/{video_filename}"
-    os.makedirs(output_dir, exist_ok=True)
+    video_filename = os.path.splitext(os.path.basename(video_path))[0]
+    video_output_dir = os.path.join(output_dir, video_filename)
+    os.makedirs(video_output_dir, exist_ok=True)
 
-    coord_filename = os.path.join(output_dir, f"box_details_{video_filename}.csv")
+    coord_filename = os.path.join(video_output_dir, f"box_details_{video_filename}.csv")
     with open(coord_filename, 'w', newline='') as coord_file:
         coord_writer = csv.writer(coord_file)
         coord_writer.writerow(["box_name", "coordinates"])
         for box_name, box_info in box_data.items():
             coord_writer.writerow([box_name, box_info["coords"]])
 
-    data_filename = os.path.join(output_dir, f"fish_data_{video_filename}.csv")
+    data_filename = os.path.join(video_output_dir, f"fish_data_{video_filename}.csv")
     with open(data_filename, 'w', newline='') as data_file:
         data_writer = csv.writer(data_file)
         data_writer.writerow(["box_name", "time_spent (s)", "distance_traveled (m)", "average_speed (m/s)"])
 
-        center_filename = os.path.join(output_dir, f"fish_coords_{video_filename}.csv")
+        center_filename = os.path.join(video_output_dir, f"fish_coords_{video_filename}.csv")
         with open(center_filename, 'w', newline='') as center_file:
             center_writer = csv.writer(center_file)
             center_writer.writerow(["frame", "contour_id", "center_x (px)", "center_y (px)", 
@@ -649,7 +832,7 @@ def main():
             prev_box_positions = [None] * len(box_data)
 
             max_frames = min(9000, total_frames)
-            pbar = tqdm(total=max_frames, desc="Processing Video", unit="frame", dynamic_ncols=True)
+            pbar = tqdm(total=max_frames, desc=f"Processing {video_filename}", unit="frame", dynamic_ncols=True)
 
             previous_center = None
             total_speed = 0
@@ -662,10 +845,14 @@ def main():
             ret, first_frame = cap.read()
             if not ret:
                 print("Error: Cannot read the first frame.")
-                sys.exit(1)
+                return None, None
 
-            # Use tank_points from JSON if available, otherwise prompt user
-            tank_mask, tank_points = create_tank_mask(first_frame, points=tank_points)
+            # Use provided tank_points or prompt user
+            if tank_points is None:
+                tank_mask, tank_points = create_tank_mask(first_frame)
+            else:
+                tank_mask, _ = create_tank_mask(first_frame, points=tank_points)
+            
             print(f"Tank boundary defined with {len(tank_points)} points")
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -883,6 +1070,386 @@ def main():
                     avg_speed_in_box = 0
                 
                 data_writer.writerow([box_name, time_spent[i], distance_in_box[i], avg_speed_in_box])
+    
+    print(f"Processing complete for {video_filename}")
+    return box_data, tank_points
+
+def analyze_processed_data(output_dir):
+    """
+    Analyze all processed data in the output directory and create simplified CSV files.
+    
+    Args:
+        output_dir (str): Directory containing processed data.
+    """
+    print("Analyzing processed data...")
+    
+    # Find all video subdirectories
+    video_dirs = [d for d in os.listdir(output_dir) if os.path.isdir(os.path.join(output_dir, d))]
+    
+    if not video_dirs:
+        print("No processed video data found.")
+        return
+
+    # Process each video directory and save results in the video-specific folder
+    for video_dir in video_dirs:
+        video_path = os.path.join(output_dir, video_dir)
+        video_name = video_dir
+        
+        print(f"Analyzing data for {video_name}...")
+        
+        # Create output files in the video's directory - just the summary and visits files
+        summary_file = os.path.join(video_path, "summary_statistics.csv")
+        visits_file = os.path.join(video_path, "box_visits.csv")
+        
+        # Find fish data file
+        fish_data_file = None
+        for file in os.listdir(video_path):
+            if file.startswith("fish_data_") and file.endswith(".csv"):
+                fish_data_file = os.path.join(video_path, file)
+                break
+        
+        if not fish_data_file:
+            print(f"No fish data found for {video_name}, skipping...")
+            continue
+        
+        # Process fish data for this video
+        box_data = {}
+        total_time = 0
+        total_distance = 0
+        
+        with open(fish_data_file, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            
+            # Convert to numpy arrays for faster processing
+            box_names = np.array([row["box_name"] for row in rows])
+            time_spent = np.array([float(row["time_spent (s)"]) for row in rows])
+            distance = np.array([float(row["distance_traveled (m)"]) for row in rows])
+            speed = np.array([float(row["average_speed (m/s)"]) for row in rows])
+            
+            # Get unique box names
+            unique_boxes = np.unique(box_names)
+            
+            for box_name in unique_boxes:
+                # Use numpy mask to filter data for this box
+                mask = box_names == box_name
+                box_data[box_name] = {
+                    "time_spent": np.sum(time_spent[mask]),
+                    "distance": np.sum(distance[mask]),
+                    "speed": np.mean(speed[mask])
+                }
+            
+            # Calculate totals
+            total_time = np.sum(time_spent)
+            total_distance = np.sum(distance)
+        
+        # Calculate mean speed overall
+        mean_speed_overall = total_distance / total_time if total_time > 0 else 0
+        
+        # Identify left, right, and central boxes
+        left_box = None
+        right_box = None
+        central_box = None
+        
+        # Find box details file to determine box positions
+        box_details_file = None
+        for file in os.listdir(video_path):
+            if file.startswith("box_details_") and file.endswith(".csv"):
+                box_details_file = os.path.join(video_path, file)
+                break
+                
+        if box_details_file:
+            with open(box_details_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                boxes = list(reader)
+                
+                # Simple heuristic: sort boxes by x-coordinate and assign left/right/central
+                if len(boxes) >= 3:
+                    # Extract x-coordinate from the first point of each box
+                    for box in boxes:
+                        coords_str = box["coordinates"]
+                        try:
+                            # Assuming format like "[(x1,y1), (x2,y2), ...]"
+                            coords = np.array(eval(coords_str))
+                            # Calculate centroid using numpy mean
+                            box["x_center"] = np.mean(coords[:, 0]) if coords.size > 0 else 0
+                        except:
+                            box["x_center"] = 0
+                    
+                    # Sort by x-coordinate
+                    sorted_boxes = sorted(boxes, key=lambda b: b["x_center"])
+                    
+                    left_box = sorted_boxes[0]["box_name"]
+                    central_box = sorted_boxes[1]["box_name"] if len(sorted_boxes) > 2 else None
+                    right_box = sorted_boxes[-1]["box_name"]
+                elif len(boxes) == 2:
+                    # With only two boxes, assume left and right
+                    left_box = boxes[0]["box_name"]
+                    right_box = boxes[1]["box_name"]
+        
+        # Initialize visit counts
+        left_visits = 0
+        right_visits = 0
+        current_box = None
+
+        # Read coordinates to count visits
+        coords_file = fish_data_file  # Assuming the fish data file contains coordinates
+        if coords_file:
+            with open(coords_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Assuming row contains 'center_x' and 'center_y' for the fish's position
+                    center_x = float(row['center_x (px)'])
+                    center_y = float(row['center_y (px)'])
+
+                    # Determine which box the fish is in based on its coordinates
+                    if left_box and is_point_in_box((center_x, center_y), box_data[left_box]["coords"]):
+                        if current_box != left_box:
+                            left_visits += 1
+                            current_box = left_box
+                    elif right_box and is_point_in_box((center_x, center_y), box_data[right_box]["coords"]):
+                        if current_box != right_box:
+                            right_visits += 1
+                            current_box = right_box
+                    else:
+                        current_box = None  # Fish is not in any box
+
+        # Create data in vertical format for summary statistics
+        summary_data = [
+            ["metric", "value"],
+            ["video_name", video_name],
+            ["cumulative_time_spent_total", total_time],
+            ["cumulative_time_spent_left_box", box_data.get(left_box, {}).get("time_spent", 0) if left_box else 0],
+            ["cumulative_time_spent_right_box", box_data.get(right_box, {}).get("time_spent", 0) if right_box else 0],
+            ["cumulative_time_spent_central_region", box_data.get(central_box, {}).get("time_spent", 0) if central_box else 0],
+            ["mean_speed_overall", mean_speed_overall],
+            ["mean_speed_left_box", box_data.get(left_box, {}).get("speed", 0) if left_box else 0],
+            ["mean_speed_right_box", box_data.get(right_box, {}).get("speed", 0) if right_box else 0],
+            ["mean_speed_central_region", box_data.get(central_box, {}).get("speed", 0) if central_box else 0],
+            ["overall_distance_travelled", total_distance],
+            ["distance_travelled_left_box", box_data.get(left_box, {}).get("distance", 0) if left_box else 0],
+            ["distance_travelled_right_box", box_data.get(right_box, {}).get("distance", 0) if right_box else 0],
+            ["distance_travelled_central_region", box_data.get(central_box, {}).get("distance", 0) if central_box else 0],
+            ["number_of_visits_left_box", left_visits],
+            ["number_of_visits_right_box", right_visits]
+        ]
+        
+        # Write summary statistics CSV in vertical format
+        with open(summary_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerows(summary_data)
+        
+        print(f"Analysis for {video_name} complete. Results saved to:")
+        print(f"  - {summary_file}")
+
+    print("All video analysis complete!")
+
+def is_point_in_box(point, box_coords):
+    """
+    Check if a point is inside a box defined by its coordinates.
+    
+    Args:
+        point (tuple): The (x, y) coordinates of the point.
+        box_coords (list): List of (x, y) tuples defining the box corners.
+    
+    Returns:
+        bool: True if the point is inside the box, False otherwise.
+    """
+    # Convert to numpy arrays for better performance
+    point = np.array(point)
+    box_coords = np.array(box_coords)
+    
+    # Use numpy's cross product for point-in-polygon test
+    n = len(box_coords)
+    inside = False
+    
+    # Use numpy's vectorized operations for ray casting algorithm
+    x, y = point
+    
+    j = n - 1
+    for i in range(n):
+        xi, yi = box_coords[i]
+        xj, yj = box_coords[j]
+        
+        intersect = ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi)
+        if intersect:
+            inside = not inside
+        j = i
+    
+    return inside
+
+def batch_process_videos(video_files, output_dir, source_type, batch_size=5):
+    """
+    Process videos in batches.
+    
+    Args:
+        video_files (list): List of video files to process.
+        output_dir (str): Directory to save output files.
+        source_type (str): Source type ('g' for Google Drive, 'o' for OneDrive, 'i' for internal).
+        batch_size (int, optional): Number of videos to process in each batch. Defaults to 5.
+        
+    Returns:
+        bool: True if processing was successful, False otherwise.
+    """
+    temp_dir = os.path.join(output_dir, "temp_videos")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Get box data and tank points from the first video
+    print("Processing first video to establish box and tank coordinates...")
+    
+    first_video = video_files[0]
+    first_video_path = ""
+    
+    if source_type == 'g':
+        first_video_path = os.path.join(temp_dir, first_video['name'])
+        if not download_from_google_drive(first_video['id'], first_video_path):
+            return False
+    elif source_type == 'o':
+        first_video_path = os.path.join(temp_dir, first_video['name'])
+        if not download_from_onedrive(first_video['url'], first_video_path):
+            return False
+    else:  # internal
+        first_video_path = first_video['path']
+    
+    # Process the first video and get box data and tank points
+    enable_visualization = input("Enable visualization for the first video? (y/n): ").strip().lower() == 'y'
+    box_data, tank_points = process_video(first_video_path, output_dir, enable_visualization=enable_visualization)
+    
+    if box_data is None or tank_points is None:
+        print("Failed to process the first video. Aborting batch processing.")
+        return False
+    
+    # Save box data and tank points for future reference
+    config_data = {**box_data, "tank_coordinates": tank_points}
+    config_file = os.path.join(output_dir, "batch_config.json")
+    with open(config_file, 'w') as f:
+        json.dump(config_data, f)
+    
+    # Clean up the first video if it was downloaded
+    if source_type in ['g', 'o']:
+        os.remove(first_video_path)
+    
+    # Process the remaining videos in batches
+    remaining_videos = video_files[1:]
+    total_batches = (len(remaining_videos) + batch_size - 1) // batch_size
+    
+    for batch_idx in range(total_batches):
+        print(f"\nProcessing batch {batch_idx + 1} of {total_batches}...")
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(remaining_videos))
+        batch_videos = remaining_videos[batch_start:batch_end]
+        
+        # Download batch videos if needed
+        batch_video_paths = []
+        for video in batch_videos:
+            if source_type == 'g':
+                video_path = os.path.join(temp_dir, video['name'])
+                if download_from_google_drive(video['id'], video_path):
+                    batch_video_paths.append(video_path)
+            elif source_type == 'o':
+                video_path = os.path.join(temp_dir, video['name'])
+                if download_from_onedrive(video['url'], video_path):
+                    batch_video_paths.append(video_path)
+            else:  # internal
+                batch_video_paths.append(video['path'])
+        
+        # Process each video in the batch
+        for video_path in batch_video_paths:
+            process_video(video_path, output_dir, box_data, tank_points, enable_visualization=False)
+            
+            # Clean up downloaded videos
+            if source_type in ['g', 'o'] and os.path.exists(video_path):
+                os.remove(video_path)
+    
+    # Clean up temp directory
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    
+    return True
+
+def main():
+    """
+    Main function to execute fish tracking and analysis.
+    """
+    print("Fish Tracking System")
+    print("===================")
+    
+    # Prompt for processing mode
+    processing_mode = input("Select processing mode: (s)ingle video or (b)atch processing? (s/b): ").strip().lower()
+    if processing_mode not in ['s', 'b']:
+        print("Invalid selection. Exiting.")
+        return
+    
+    # Prompt for file source
+    file_source = input("Select file source: (g)oogle Drive, (o)neDrive, or (i)nternal files? (g/o/i): ").strip().lower()
+    if file_source not in ['g', 'o', 'i']:
+        print("Invalid selection. Exiting.")
+        return
+    
+    # Set up output directory
+    output_dir = input("Enter output directory path (default: ./Data): ").strip()
+    if not output_dir:
+        output_dir = "./Data"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    if processing_mode == 's':
+        # Single video processing
+        video_path = ""
+        
+        if file_source == 'g':
+            file_id = input("Enter Google Drive file ID: ").strip()
+            video_name = input("Enter video filename (with extension): ").strip()
+            video_path = os.path.join(output_dir, "temp_" + video_name)
+            if not download_from_google_drive(file_id, video_path):
+                print("Failed to download video. Exiting.")
+                return
+        elif file_source == 'o':
+            file_url = input("Enter OneDrive file URL: ").strip()
+            video_name = input("Enter video filename (with extension): ").strip()
+            video_path = os.path.join(output_dir, "temp_" + video_name)
+            if not download_from_onedrive(file_url, video_path):
+                print("Failed to download video. Exiting.")
+                return
+        else:  # internal
+            video_path = input("Enter path to video file: ").strip()
+        
+        enable_visualization = input("Enable visualization? (y/n): ").strip().lower() == 'y'
+        
+        # Process the video
+        process_video(video_path, output_dir, enable_visualization=enable_visualization)
+        
+        # Clean up downloaded video if needed
+        if file_source in ['g', 'o'] and os.path.exists(video_path):
+            os.remove(video_path)
+        
+        # Add this line to analyze the single video data
+        analyze_processed_data(output_dir)
+        
+    else:  # Batch processing
+        video_files = []
+        
+        if file_source == 'g':
+            folder_id = input("Enter Google Drive folder ID: ").strip()
+            video_files = get_video_files_from_google_drive(folder_id)
+        elif file_source == 'o':
+            folder_url = input("Enter OneDrive folder URL: ").strip()
+            video_files = get_video_files_from_onedrive(folder_url)
+        else:  # internal
+            folder_path = input("Enter path to folder containing videos: ").strip()
+            video_files = get_local_video_files(folder_path)
+        
+        if not video_files:
+            print("No video files found. Exiting.")
+            return
+        
+        print(f"Found {len(video_files)} video files.")
+        
+        # Process videos in batches
+        if batch_process_videos(video_files, output_dir, file_source):
+            # Analyze all processed data
+            analyze_processed_data(output_dir)
+        else:
+            print("Batch processing failed.")
 
 if __name__ == "__main__":
     main()
