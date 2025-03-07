@@ -19,22 +19,24 @@ import requests
 from office365.runtime.auth.authentication_context import AuthenticationContext
 from office365.sharepoint.client_context import ClientContext
 from office365.sharepoint.files.file import File
+import re
 
 # Constants
 MAX_DISTANCE_THRESHOLD = 150 
 PIXEL_TO_METER = 0.000099  
 VISUALIZATION_FRAME_SKIP = 15 
 
-def download_from_google_drive(file_id, destination):
+def download_from_google_drive(file_id, destination=None):
     """
     Download a file from Google Drive.
     
     Args:
         file_id (str): The ID of the file to download.
-        destination (str): The path where the file will be saved.
+        destination (str, optional): The path where the file will be saved.
+                                    If None, will use the original filename.
     
     Returns:
-        bool: True if download was successful, False otherwise.
+        tuple: (bool, str) - Success status and the path where the file was saved.
     """
     try:
         # Load credentials from a file or environment
@@ -42,6 +44,14 @@ def download_from_google_drive(file_id, destination):
         
         # Build the Drive API client
         service = build('drive', 'v3', credentials=creds)
+        
+        # Get file metadata to retrieve the original filename
+        file_metadata = service.files().get(fileId=file_id, fields="name").execute()
+        original_filename = file_metadata.get('name', 'downloaded_file')
+        
+        # If destination is not specified, use the original filename
+        if destination is None:
+            destination = os.path.join(os.getcwd(), original_filename)
         
         # Create a BytesIO object to store the downloaded file
         request = service.files().get_media(fileId=file_id)
@@ -58,10 +68,10 @@ def download_from_google_drive(file_id, destination):
         with open(destination, 'wb') as f:
             f.write(file_handle.getvalue())
             
-        return True
+        return True, destination
     except Exception as e:
         print(f"Error downloading from Google Drive: {e}")
-        return False
+        return False, None
 
 def download_from_onedrive(file_url, destination):
     """
@@ -1291,6 +1301,12 @@ def batch_process_videos(video_files, output_dir, source_type, batch_size=5):
     Returns:
         bool: True if processing was successful, False otherwise.
     """
+    if not video_files:
+        print("No video files to process.")
+        return False
+        
+    print(f"Found {len(video_files)} videos to process.")
+    
     temp_dir = os.path.join(output_dir, "temp_videos")
     os.makedirs(temp_dir, exist_ok=True)
     
@@ -1300,72 +1316,163 @@ def batch_process_videos(video_files, output_dir, source_type, batch_size=5):
     first_video = video_files[0]
     first_video_path = ""
     
-    if source_type == 'g':
-        first_video_path = os.path.join(temp_dir, first_video['name'])
-        if not download_from_google_drive(first_video['id'], first_video_path):
-            return False
-    elif source_type == 'o':
-        first_video_path = os.path.join(temp_dir, first_video['name'])
-        if not download_from_onedrive(first_video['url'], first_video_path):
-            return False
-    else:  # internal
-        first_video_path = first_video['path']
-    
-    # Process the first video and get box data and tank points
-    enable_visualization = input("Enable visualization for the first video? (y/n): ").strip().lower() == 'y'
-    box_data, tank_points = process_video(first_video_path, output_dir, enable_visualization=enable_visualization)
-    
-    if box_data is None or tank_points is None:
-        print("Failed to process the first video. Aborting batch processing.")
-        return False
-    
-    # Save box data and tank points for future reference
-    config_data = {**box_data, "tank_coordinates": tank_points}
-    config_file = os.path.join(output_dir, "batch_config.json")
-    with open(config_file, 'w') as f:
-        json.dump(config_data, f)
-    
-    # Clean up the first video if it was downloaded
-    if source_type in ['g', 'o']:
-        os.remove(first_video_path)
-    
-    # Process the remaining videos in batches
-    remaining_videos = video_files[1:]
-    total_batches = (len(remaining_videos) + batch_size - 1) // batch_size
-    
-    for batch_idx in range(total_batches):
-        print(f"\nProcessing batch {batch_idx + 1} of {total_batches}...")
-        batch_start = batch_idx * batch_size
-        batch_end = min(batch_start + batch_size, len(remaining_videos))
-        batch_videos = remaining_videos[batch_start:batch_end]
+    try:
+        if source_type == 'g':
+            success, first_video_path = download_from_google_drive(first_video['id'])
+            if not success:
+                print("Failed to download the first video.")
+                return False
+            # Move to temp directory
+            new_path = os.path.join(temp_dir, os.path.basename(first_video_path))
+            shutil.move(first_video_path, new_path)
+            first_video_path = new_path
+            print(f"Successfully downloaded: {os.path.basename(first_video_path)}")
+        elif source_type == 'o':
+            first_video_path = os.path.join(temp_dir, first_video['name'])
+            if not download_from_onedrive(first_video['url'], first_video_path):
+                return False
+        else:  # internal
+            first_video_path = first_video['path']
         
-        # Download batch videos if needed
-        batch_video_paths = []
-        for video in batch_videos:
-            if source_type == 'g':
-                video_path = os.path.join(temp_dir, video['name'])
-                if download_from_google_drive(video['id'], video_path):
-                    batch_video_paths.append(video_path)
-            elif source_type == 'o':
-                video_path = os.path.join(temp_dir, video['name'])
-                if download_from_onedrive(video['url'], video_path):
-                    batch_video_paths.append(video_path)
-            else:  # internal
-                batch_video_paths.append(video['path'])
+        # Process the first video and get box data and tank points
+        enable_visualization = input("Enable visualization for the first video? (y/n): ").strip().lower() == 'y'
+        box_data, tank_points = process_video(first_video_path, output_dir, enable_visualization=enable_visualization)
         
-        # Process each video in the batch
-        for video_path in batch_video_paths:
-            process_video(video_path, output_dir, box_data, tank_points, enable_visualization=False)
+        if box_data is None or tank_points is None:
+            print("Failed to process the first video. Aborting batch processing.")
+            return False
+        
+        # Save box data and tank points for future reference
+        config_data = {**box_data, "tank_coordinates": tank_points}
+        config_file = os.path.join(output_dir, "batch_config.json")
+        with open(config_file, 'w') as f:
+            json.dump(config_data, f)
+        
+        # Clean up the first video if it was downloaded
+        if source_type in ['g', 'o']:
+            os.remove(first_video_path)
+        
+        # Process the remaining videos in batches of exactly 5 (or fewer for the last batch)
+        remaining_videos = video_files[1:]
+        total_batches = (len(remaining_videos) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(total_batches):
+            print(f"\nProcessing batch {batch_idx + 1} of {total_batches}...")
+            batch_start = batch_idx * batch_size
+            batch_end = min(batch_start + batch_size, len(remaining_videos))
+            batch_videos = remaining_videos[batch_start:batch_end]
             
-            # Clean up downloaded videos
-            if source_type in ['g', 'o'] and os.path.exists(video_path):
-                os.remove(video_path)
+            print(f"Downloading {len(batch_videos)} videos for this batch...")
+            
+            # Download batch videos if needed
+            batch_video_paths = []
+            for video in batch_videos:
+                if source_type == 'g':
+                    print(f"Downloading: {video['name']}...")
+                    success, video_path = download_from_google_drive(video['id'])
+                    if success:
+                        # Move to temp directory
+                        new_path = os.path.join(temp_dir, os.path.basename(video_path))
+                        shutil.move(video_path, new_path)
+                        batch_video_paths.append(new_path)
+                        print(f"Successfully downloaded: {os.path.basename(new_path)}")
+                    else:
+                        print(f"Failed to download: {video['name']}")
+                elif source_type == 'o':
+                    video_path = os.path.join(temp_dir, video['name'])
+                    if download_from_onedrive(video['url'], video_path):
+                        batch_video_paths.append(video_path)
+                else:  # internal
+                    batch_video_paths.append(video['path'])
+            
+            # Process each video in the batch
+            for video_path in batch_video_paths:
+                print(f"Processing: {os.path.basename(video_path)}...")
+                process_video(video_path, output_dir, box_data, tank_points, enable_visualization=False)
+                
+                # Clean up downloaded videos immediately after processing
+                if source_type in ['g', 'o'] and os.path.exists(video_path):
+                    os.remove(video_path)
+                    print(f"Removed temporary file: {os.path.basename(video_path)}")
+            
+            print(f"Completed batch {batch_idx + 1} of {total_batches}")
     
-    # Clean up temp directory
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
+    except Exception as e:
+        print(f"Error during batch processing: {e}")
+        return False
+    finally:
+        # Clean up temp directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            print("Cleaned up temporary directory")
     
     return True
+
+def extract_id_from_drive_link(link):
+    """
+    Extract the file or folder ID from a Google Drive link.
+    
+    Args:
+        link (str): Google Drive link
+        
+    Returns:
+        str: The extracted ID or None if not found
+    """
+    # Pattern for folder links
+    folder_pattern = r'(?:https?://drive\.google\.com/(?:drive/folders/|file/d/|open\?id=))([a-zA-Z0-9_-]+)'
+    
+    match = re.search(folder_pattern, link)
+    if match:
+        return match.group(1)
+    
+    return None
+
+def setup_google_credentials():
+    """
+    Set up Google Drive credentials interactively if not already set.
+    
+    Returns:
+        bool: True if credentials are set up successfully, False otherwise
+    """
+    if os.environ.get('GOOGLE_CREDENTIALS'):
+        return True
+        
+    print("\nGoogle Drive credentials not found.")
+    print("You need to set up credentials to access Google Drive.")
+    print("Options:")
+    print("1. Enter JSON credentials directly")
+    print("2. Load from a credentials file")
+    
+    choice = input("Enter your choice (1/2): ").strip()
+    
+    if choice == '1':
+        credentials_json = input("Paste your Google credentials JSON: ").strip()
+        try:
+            # Validate JSON format
+            json.loads(credentials_json)
+            os.environ['GOOGLE_CREDENTIALS'] = credentials_json
+            return True
+        except json.JSONDecodeError:
+            print("Error: Invalid JSON format")
+            return False
+    elif choice == '2':
+        file_path = input("Enter path to credentials JSON file: ").strip()
+        try:
+            with open(file_path, 'r') as f:
+                credentials_json = f.read()
+            # Validate JSON format
+            json.loads(credentials_json)
+            os.environ['GOOGLE_CREDENTIALS'] = credentials_json
+            return True
+        except FileNotFoundError:
+            print(f"Error: File not found at {file_path}")
+            return False
+        except json.JSONDecodeError:
+            print("Error: Invalid JSON format in credentials file")
+            return False
+    else:
+        print("Invalid choice")
+        return False
 
 def main():
     """
@@ -1392,17 +1499,32 @@ def main():
         output_dir = "./Data"
     os.makedirs(output_dir, exist_ok=True)
     
+    # Set up Google credentials if needed
+    if file_source == 'g' and not setup_google_credentials():
+        print("Failed to set up Google credentials. Exiting.")
+        return
+    
     if processing_mode == 's':
         # Single video processing
         video_path = ""
         
         if file_source == 'g':
-            file_id = input("Enter Google Drive file ID: ").strip()
-            video_name = input("Enter video filename (with extension): ").strip()
-            video_path = os.path.join(output_dir, "temp_" + video_name)
-            if not download_from_google_drive(file_id, video_path):
+            drive_link = input("Enter Google Drive link to the video: ").strip()
+            file_id = extract_id_from_drive_link(drive_link)
+            
+            if not file_id:
+                print("Invalid Google Drive link. Exiting.")
+                return
+                
+            success, video_path = download_from_google_drive(file_id)
+            if not success:
                 print("Failed to download video. Exiting.")
                 return
+            # Move the file to the output directory with a temp prefix
+            video_name = os.path.basename(video_path)
+            new_path = os.path.join(output_dir, "temp_" + video_name)
+            shutil.move(video_path, new_path)
+            video_path = new_path
         elif file_source == 'o':
             file_url = input("Enter OneDrive file URL: ").strip()
             video_name = input("Enter video filename (with extension): ").strip()
@@ -1429,7 +1551,13 @@ def main():
         video_files = []
         
         if file_source == 'g':
-            folder_id = input("Enter Google Drive folder ID: ").strip()
+            drive_link = input("Enter Google Drive link to the folder: ").strip()
+            folder_id = extract_id_from_drive_link(drive_link)
+            
+            if not folder_id:
+                print("Invalid Google Drive link. Exiting.")
+                return
+                
             video_files = get_video_files_from_google_drive(folder_id)
         elif file_source == 'o':
             folder_url = input("Enter OneDrive folder URL: ").strip()
