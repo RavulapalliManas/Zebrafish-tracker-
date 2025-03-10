@@ -20,9 +20,12 @@ from office365.runtime.auth.authentication_context import AuthenticationContext
 from office365.sharepoint.client_context import ClientContext
 from office365.sharepoint.files.file import File
 import re
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pickle
 
 # Constants
-MAX_DISTANCE_THRESHOLD = 150 
+MAX_DISTANCE_THRESHOLD = 200 
 PIXEL_TO_METER = 0.000099  
 VISUALIZATION_FRAME_SKIP = 15 
 
@@ -39,8 +42,23 @@ def download_from_google_drive(file_id, destination=None):
         tuple: (bool, str) - Success status and the path where the file was saved.
     """
     try:
-        # Load credentials from a file or environment
-        creds = Credentials.from_authorized_user_info(json.loads(os.environ.get('GOOGLE_CREDENTIALS')))
+        # Load credentials from environment
+        creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+        if not creds_json:
+            print("Google credentials not found. Please run setup_google_credentials() first.")
+            return False, None
+            
+        creds_data = json.loads(creds_json)
+        
+        # Create credentials object
+        creds = Credentials(
+            token=creds_data.get('token'),
+            refresh_token=creds_data.get('refresh_token'),
+            token_uri=creds_data.get('token_uri'),
+            client_id=creds_data.get('client_id'),
+            client_secret=creds_data.get('client_secret'),
+            scopes=creds_data.get('scopes')
+        )
         
         # Build the Drive API client
         service = build('drive', 'v3', credentials=creds)
@@ -118,8 +136,23 @@ def get_video_files_from_google_drive(folder_id):
         list: A list of dictionaries containing file IDs and names.
     """
     try:
-        # Load credentials from a file or environment
-        creds = Credentials.from_authorized_user_info(json.loads(os.environ.get('GOOGLE_CREDENTIALS')))
+        # Load credentials from environment
+        creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+        if not creds_json:
+            print("Google credentials not found. Please run setup_google_credentials() first.")
+            return []
+            
+        creds_data = json.loads(creds_json)
+        
+        # Create credentials object
+        creds = Credentials(
+            token=creds_data.get('token'),
+            refresh_token=creds_data.get('refresh_token'),
+            token_uri=creds_data.get('token_uri'),
+            client_id=creds_data.get('client_id'),
+            client_secret=creds_data.get('client_secret'),
+            scopes=creds_data.get('scopes')
+        )
         
         # Build the Drive API client
         service = build('drive', 'v3', credentials=creds)
@@ -432,20 +465,12 @@ def draw_fish_contours(enhanced, contours, boxes, time_spent, distance_in_box, p
                       original_fps, current_frame, contour_areas=None):
     """
     Draws contours on the frame and updates time spent and distance in each box.
-
-    Args:
-        enhanced (np.array): Frame to draw contours on.
-        contours (list): List of contours to draw.
-        boxes (list): List of box dictionaries.
-        time_spent (list): List to store time spent in each box.
-        distance_in_box (list): List to store total distance traveled in each box.
-        prev_box_positions (list): List to store previous positions in each box.
-        original_fps (float): Original frames per second of the video.
-        current_frame (int): Current frame number.
-        contour_areas (list, optional): Pre-calculated contour areas. Defaults to None.
     """
     detected_boxes = [False] * len(boxes)
     current_box_positions = [None] * len(boxes)
+
+    # Track if any valid fish contour was detected in this frame
+    valid_fish_detected = False
 
     for i, contour in enumerate(contours):
         if contour.dtype != np.int32:
@@ -454,6 +479,9 @@ def draw_fish_contours(enhanced, contours, boxes, time_spent, distance_in_box, p
         area = contour_areas[i] if contour_areas else cv2.contourArea(contour)
         if area < 10 or area > 1350:
             continue
+            
+        # If we found a valid fish contour
+        valid_fish_detected = True
 
         x, y, w, h = cv2.boundingRect(contour)
         cv2.rectangle(enhanced, (x, y), (x + w, y + h), (255, 255, 255), 2)
@@ -465,8 +493,11 @@ def draw_fish_contours(enhanced, contours, boxes, time_spent, distance_in_box, p
             center_y = int(M["m01"] / M["m00"])
             current_center = (center_x, center_y)
             
+            # Find which box the fish is in (only count the fish in ONE box per frame)
+            box_found = False
             for j, box in enumerate(boxes):
-                if is_contour_in_box(contour, box):
+                if is_contour_in_box(contour, box) and not box_found:
+                    box_found = True
                     detected_boxes[j] = True
                     current_box_positions[j] = current_center
                     
@@ -480,13 +511,23 @@ def draw_fish_contours(enhanced, contours, boxes, time_spent, distance_in_box, p
                         if distance <= MAX_DISTANCE_THRESHOLD:
                             distance_in_box[j] += distance * PIXEL_TO_METER
 
-    for i, detected in enumerate(detected_boxes):
-        if detected:
-            time_spent[i] += 1 / original_fps
-            prev_box_positions[i] = current_box_positions[i]
-        else:
-            # Reset previous position if fish is no longer in the box
-            prev_box_positions[i] = None
+    # Only update time if a valid fish was detected
+    if valid_fish_detected:
+        # Only increment time for ONE box per frame (the one with the fish)
+        # This ensures total time doesn't exceed video length
+        box_with_fish = None
+        for i, detected in enumerate(detected_boxes):
+            if detected:
+                if box_with_fish is None:
+                    box_with_fish = i
+                    time_spent[i] += 1 / original_fps
+                    prev_box_positions[i] = current_box_positions[i]
+                else:
+                    # Don't count time for additional boxes in the same frame
+                    prev_box_positions[i] = current_box_positions[i]
+            else:
+                # Reset previous position if fish is no longer in the box
+                prev_box_positions[i] = None
 
 def log_video_info(cap):
     """
@@ -1122,6 +1163,16 @@ def analyze_processed_data(output_dir):
             print(f"No fish data found for {video_name}, skipping...")
             continue
         
+        # Find fish coordinates file
+        fish_coords_file = None
+        for file in os.listdir(video_path):
+            if file.startswith("fish_coords_") and file.endswith(".csv"):
+                fish_coords_file = os.path.join(video_path, file)
+                break
+        
+        if not fish_coords_file:
+            print(f"No fish coordinates found for {video_name}, skipping visit analysis...")
+        
         # Process fish data for this video
         box_data = {}
         total_time = 0
@@ -1196,28 +1247,37 @@ def analyze_processed_data(output_dir):
                     # With only two boxes, assume left and right
                     left_box = boxes[0]["box_name"]
                     right_box = boxes[1]["box_name"]
+                
+                # Store box coordinates in box_data for use in is_point_in_box
+                for box in boxes:
+                    box_name = box["box_name"]
+                    if box_name in box_data:
+                        try:
+                            box_data[box_name]["coords"] = eval(box["coordinates"])
+                        except:
+                            # If we can't parse the coordinates, create an empty list
+                            box_data[box_name]["coords"] = []
         
         # Initialize visit counts
         left_visits = 0
         right_visits = 0
         current_box = None
 
-        # Read coordinates to count visits
-        coords_file = fish_data_file  # Assuming the fish data file contains coordinates
-        if coords_file:
-            with open(coords_file, 'r', newline='') as f:
+        # Read coordinates to count visits - use fish_coords_file instead of fish_data_file
+        if fish_coords_file and box_details_file:  # Only proceed if we have both files
+            with open(fish_coords_file, 'r', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # Assuming row contains 'center_x' and 'center_y' for the fish's position
+                    # Access the correct column names from the coordinates file
                     center_x = float(row['center_x (px)'])
                     center_y = float(row['center_y (px)'])
 
                     # Determine which box the fish is in based on its coordinates
-                    if left_box and is_point_in_box((center_x, center_y), box_data[left_box]["coords"]):
+                    if left_box and "coords" in box_data[left_box] and is_point_in_box((center_x, center_y), box_data[left_box]["coords"]):
                         if current_box != left_box:
                             left_visits += 1
                             current_box = left_box
-                    elif right_box and is_point_in_box((center_x, center_y), box_data[right_box]["coords"]):
+                    elif right_box and "coords" in box_data[right_box] and is_point_in_box((center_x, center_y), box_data[right_box]["coords"]):
                         if current_box != right_box:
                             right_visits += 1
                             current_box = right_box
@@ -1429,50 +1489,105 @@ def extract_id_from_drive_link(link):
 
 def setup_google_credentials():
     """
-    Set up Google Drive credentials interactively if not already set.
+    Set up Google Drive credentials with proper OAuth flow.
     
     Returns:
         bool: True if credentials are set up successfully, False otherwise
     """
-    if os.environ.get('GOOGLE_CREDENTIALS'):
-        return True
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    import pickle
+    
+    # Define the scopes needed for Google Drive access
+    SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+    
+    # Path to store the credentials
+    token_path = os.path.join(os.path.expanduser('~'), '.fish_tracking_token.pickle')
+    
+    creds = None
+    
+    # Check if we have valid saved credentials
+    if os.path.exists(token_path):
+        try:
+            with open(token_path, 'rb') as token:
+                creds = pickle.load(token)
+        except Exception as e:
+            print(f"Error loading saved credentials: {e}")
+    
+    # If credentials don't exist or are invalid, get new ones
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"Error refreshing credentials: {e}")
+                creds = None
         
-    print("\nGoogle Drive credentials not found.")
-    print("You need to set up credentials to access Google Drive.")
-    print("Options:")
-    print("1. Enter JSON credentials directly")
-    print("2. Load from a credentials file")
+        # If still no valid credentials, need to go through OAuth flow
+        if not creds:
+            print("\nNo valid Google Drive credentials found.")
+            print("You need to set up credentials to access Google Drive.")
+            print("Options:")
+            print("1. Use OAuth 2.0 client credentials file")
+            print("2. Enter client ID and secret manually")
+            
+            choice = input("Enter your choice (1/2): ").strip()
+            
+            try:
+                if choice == '1':
+                    credentials_path = input("Enter path to client credentials JSON file: ").strip()
+                    flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
+                elif choice == '2':
+                    client_id = input("Enter client ID: ").strip()
+                    client_secret = input("Enter client secret: ").strip()
+                    
+                    # Create a client config dictionary
+                    client_config = {
+                        "installed": {
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                            "token_uri": "https://oauth2.googleapis.com/token",
+                            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                            "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob", "http://localhost"]
+                        }
+                    }
+                    
+                    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+                else:
+                    print("Invalid choice")
+                    return False
+                
+                # Run the OAuth flow
+                print("\nA browser window will open for you to authenticate with Google.")
+                print("If no browser opens, check the console for a URL to visit.")
+                creds = flow.run_local_server(port=0)
+                
+                # Save the credentials for future use
+                with open(token_path, 'wb') as token:
+                    pickle.dump(creds, token)
+                
+                print("Authentication successful! Credentials saved for future use.")
+                
+            except Exception as e:
+                print(f"Error during authentication: {e}")
+                return False
     
-    choice = input("Enter your choice (1/2): ").strip()
+    # Store credentials in environment variable as JSON string
+    # This is needed for compatibility with the existing code
+    if creds:
+        creds_data = {
+            'token': creds.token,
+            'refresh_token': creds.refresh_token,
+            'token_uri': creds.token_uri,
+            'client_id': creds.client_id,
+            'client_secret': creds.client_secret,
+            'scopes': creds.scopes
+        }
+        os.environ['GOOGLE_CREDENTIALS'] = json.dumps(creds_data)
+        return True
     
-    if choice == '1':
-        credentials_json = input("Paste your Google credentials JSON: ").strip()
-        try:
-            # Validate JSON format
-            json.loads(credentials_json)
-            os.environ['GOOGLE_CREDENTIALS'] = credentials_json
-            return True
-        except json.JSONDecodeError:
-            print("Error: Invalid JSON format")
-            return False
-    elif choice == '2':
-        file_path = input("Enter path to credentials JSON file: ").strip()
-        try:
-            with open(file_path, 'r') as f:
-                credentials_json = f.read()
-            # Validate JSON format
-            json.loads(credentials_json)
-            os.environ['GOOGLE_CREDENTIALS'] = credentials_json
-            return True
-        except FileNotFoundError:
-            print(f"Error: File not found at {file_path}")
-            return False
-        except json.JSONDecodeError:
-            print("Error: Invalid JSON format in credentials file")
-            return False
-    else:
-        print("Invalid choice")
-        return False
+    return False
 
 def main():
     """
