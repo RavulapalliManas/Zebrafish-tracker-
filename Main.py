@@ -28,6 +28,15 @@ import pickle
 MAX_DISTANCE_THRESHOLD = 200 
 PIXEL_TO_METER = 0.000099  
 VISUALIZATION_FRAME_SKIP = 15 
+RETINEX_SIGMA_LIST = [15, 80, 250]  # Multiple scales for MSR
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_GRID_SIZE = (8, 8)
+LAB_L_CLIP_LIMIT = 2.0
+MIN_FISH_AREA = 100  # Minimum area for fish detection
+MAX_FISH_AREA = 2000  # Maximum area for fish detection
+FISH_ASPECT_RATIO_RANGE = (0.3, 3.0)  # Expected fish shape ratio
+MOVEMENT_THRESHOLD = 5  # Minimum movement to consider as fish
+HISTORY_LENGTH = 10  # Frames to keep in motion history
 
 def download_from_google_drive(file_id, destination=None):
     """
@@ -351,66 +360,175 @@ def initialize_video_capture(path):
         exit()
     return cap
 
-def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
+def apply_msrcr(img, sigma_list=RETINEX_SIGMA_LIST):
     """
-    Preprocesses a single video frame.
-
-    Includes resizing, grayscale conversion, brightness adjustment, Gaussian blur, 
-    sharpening, and CLAHE enhancement.
-
+    Apply Multi-Scale Retinex with Color Restoration (MSRCR).
+    Helps enhance image details in varying illumination conditions.
+    
     Args:
-        frame (np.array): Input video frame.
-        brightness_increase (int): Value to increase brightness by.
-        clahe (cv2.CLAHE): CLAHE object for contrast enhancement.
-        scale_factor (float, optional): Scaling factor for resizing the frame. Defaults to 0.5.
-
+        img (np.array): Input BGR image
+        sigma_list (list): List of Gaussian blur sigmas for multiple scales
+        
     Returns:
-        tuple: Enhanced frame and the scale factor used.
+        np.array: Enhanced image
     """
+    img = img.astype(np.float32) / 255.0
+    img = np.clip(img, 0.01, 1.0)
+    
+    # Convert to log domain
+    img_log = np.log10(img)
+    
+    # Initialize retinex output
+    retinex = np.zeros_like(img_log)
+    
+    # Multi-scale retinex
+    for sigma in sigma_list:
+        # Calculate Gaussian blur
+        gaussian = cv2.GaussianBlur(img_log, (0, 0), sigma)
+        # Calculate difference
+        retinex += img_log - gaussian
+    
+    # Average over scales
+    retinex = retinex / len(sigma_list)
+    
+    # Color restoration
+    img_sum = np.sum(img, axis=2, keepdims=True)
+    color_restoration = np.log10(img * 125.0 / (img_sum + 1e-6))
+    
+    # Combine MSR with color restoration
+    msrcr = retinex * color_restoration
+    
+    # Normalize and convert back to linear domain
+    msrcr = (msrcr - np.min(msrcr)) / (np.max(msrcr) - np.min(msrcr))
+    msrcr = np.power(10, msrcr)
+    
+    # Final normalization and conversion to uint8
+    msrcr = (msrcr * 255.0).astype(np.uint8)
+    return msrcr
+
+def enhance_lab_image(img):
+    """
+    Enhance image using LAB color space.
+    LAB is better for separating luminance from color information.
+    
+    Args:
+        img (np.array): Input BGR image
+        
+    Returns:
+        np.array: Enhanced image
+    """
+    # Convert to LAB color space
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    
+    # Apply CLAHE to L channel
+    clahe = cv2.createCLAHE(clipLimit=LAB_L_CLIP_LIMIT, tileGridSize=CLAHE_GRID_SIZE)
+    l_enhanced = clahe.apply(l)
+    
+    # Merge channels back
+    lab_enhanced = cv2.merge([l_enhanced, a, b])
+    
+    # Convert back to BGR
+    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+    return enhanced
+
+def apply_adaptive_threshold(img, block_size=11, c=2):
+    """
+    Apply adaptive thresholding to handle varying illumination.
+    
+    Args:
+        img (np.array): Grayscale input image
+        block_size (int): Size of pixel neighborhood for thresholding
+        c (int): Constant subtracted from mean
+        
+    Returns:
+        np.array: Binary threshold image
+    """
+    # Ensure odd block size
+    block_size = block_size if block_size % 2 == 1 else block_size + 1
+    
+    # Apply adaptive threshold
+    thresh = cv2.adaptiveThreshold(
+        img,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        block_size,
+        c
+    )
+    return thresh
+
+def detect_fish(enhanced, bg_subtractor, min_contour_area=MIN_FISH_AREA, max_contour_area=MAX_FISH_AREA):
+    """Enhanced fish detection with multiple validation steps"""
+    # Apply background subtraction with shadow detection
+    fg_mask = bg_subtractor.apply(enhanced, learningRate=0.005)
+    
+    # Remove shadows (typically marked as 127 in mask)
+    _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+    
+    # Noise reduction
+    fg_mask = cv2.medianBlur(fg_mask, 5)
+    
+    # Morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+    
+    # Find contours
+    contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    valid_contours = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if min_contour_area < area < max_contour_area:
+            # Get rotated rectangle
+            rect = cv2.minAreaRect(cnt)
+            width = rect[1][0]
+            height = rect[1][1]
+            
+            # Aspect ratio check
+            aspect_ratio = min(width, height) / max(width, height) if max(width, height) > 0 else 0
+            if FISH_ASPECT_RATIO_RANGE[0] <= aspect_ratio <= FISH_ASPECT_RATIO_RANGE[1]:
+                
+                # Convexity check
+                hull = cv2.convexHull(cnt)
+                hull_area = cv2.contourArea(hull)
+                solidity = float(area) / hull_area if hull_area > 0 else 0
+                
+                # Perimeter and circularity
+                perimeter = cv2.arcLength(cnt, True)
+                circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+                
+                # Combined shape validation
+                if 0.5 < solidity < 0.95 and 0.2 < circularity < 0.8:
+                    valid_contours.append(cnt)
+    
+    return valid_contours
+
+def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
+    """Enhanced preprocessing with better noise handling"""
     if scale_factor != 1.0:
         frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor)
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.add(gray, brightness_increase)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    sharpening_kernel = np.array([[-1, -1, -1],
-                                  [-1,  9, -1],
-                                  [-1, -1, -1]])
-    sharpened = cv2.filter2D(blurred, -1, sharpening_kernel)
+    # Denoise first
+    denoised = cv2.fastNlMeansDenoisingColored(frame, None, 10, 10, 7, 21)
     
-    enhanced = clahe.apply(sharpened)
-
-    return enhanced, scale_factor
-
-def detect_fish(enhanced, bg_subtractor, min_contour_area=10, max_contour_area=1350):
-    """
-    Detect the largest fish in the given frame using background subtraction and contour detection.
-
-    Args:
-        enhanced (np.array): Preprocessed grayscale frame.
-        bg_subtractor (cv2.BackgroundSubtractorKNN): Background subtractor object.
-        min_contour_area (int, optional): Minimum contour area to consider as fish. Defaults to 10.
-        max_contour_area (int, optional): Maximum contour area to consider as fish. Defaults to 1350.
-
-    Returns:
-        list: List of largest contour if found within area limits, otherwise empty list.
-    """
-    fg_mask = bg_subtractor.apply(enhanced)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    eroded_mask = cv2.erode(fg_mask, kernel, iterations=1)
-    dilated_mask = cv2.dilate(eroded_mask, kernel, iterations=1)
-    edges = cv2.Canny(dilated_mask, 50, 150)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if contours:
-        valid_contours = [cnt for cnt in contours if min_contour_area < cv2.contourArea(cnt) < max_contour_area]
-        if valid_contours:
-            largest_contour = max(valid_contours, key=cv2.contourArea)
-            return [largest_contour]
-
-    return []
+    # Apply retinex enhancement
+    enhanced = apply_msrcr(denoised)
+    
+    # Enhance in LAB color space
+    enhanced = enhance_lab_image(enhanced)
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+    
+    # Local contrast enhancement
+    clahe_enhanced = clahe.apply(gray)
+    
+    # Edge-preserving smoothing
+    smoothed = cv2.bilateralFilter(clahe_enhanced, 9, 75, 75)
+    
+    return smoothed, scale_factor
 
 def process_frame(frame, bg_subtractor, clahe, brightness_increase, scale_factor):
     """
@@ -1128,9 +1246,6 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
 def analyze_processed_data(output_dir):
     """
     Analyze all processed data in the output directory and create simplified CSV files.
-    
-    Args:
-        output_dir (str): Directory containing processed data.
     """
     print("Analyzing processed data...")
     
@@ -1141,39 +1256,35 @@ def analyze_processed_data(output_dir):
         print("No processed video data found.")
         return
 
-    # Process each video directory and save results in the video-specific folder
     for video_dir in video_dirs:
         video_path = os.path.join(output_dir, video_dir)
         video_name = video_dir
         
         print(f"Analyzing data for {video_name}...")
         
-        # Create output files in the video's directory - just the summary and visits files
+        # Create output files
         summary_file = os.path.join(video_path, "summary_statistics.csv")
         visits_file = os.path.join(video_path, "box_visits.csv")
         
-        # Find fish data file
+        # Find required files
         fish_data_file = None
+        fish_coords_file = None
+        box_details_file = None
+        
         for file in os.listdir(video_path):
             if file.startswith("fish_data_") and file.endswith(".csv"):
                 fish_data_file = os.path.join(video_path, file)
-                break
+            elif file.startswith("fish_coords_") and file.endswith(".csv"):
+                fish_coords_file = os.path.join(video_path, file)
+            elif file.startswith("box_details_") and file.endswith(".csv"):
+                box_details_file = os.path.join(video_path, file)
         
         if not fish_data_file:
             print(f"No fish data found for {video_name}, skipping...")
             continue
-        
-        # Find fish coordinates file
-        fish_coords_file = None
-        for file in os.listdir(video_path):
-            if file.startswith("fish_coords_") and file.endswith(".csv"):
-                fish_coords_file = os.path.join(video_path, file)
-                break
-        
-        if not fish_coords_file:
-            print(f"No fish coordinates found for {video_name}, skipping visit analysis...")
-        
-        # Process fish data for this video
+            
+        # Create case-insensitive box name mapping
+        box_name_map = {}
         box_data = {}
         total_time = 0
         total_distance = 0
@@ -1182,17 +1293,21 @@ def analyze_processed_data(output_dir):
             reader = csv.DictReader(f)
             rows = list(reader)
             
-            # Convert to numpy arrays for faster processing
+            # Create case-insensitive mapping for box names
+            for row in rows:
+                orig_name = row["box_name"]
+                lower_name = orig_name.lower()
+                box_name_map[lower_name] = orig_name
+            
+            # Convert to numpy arrays
             box_names = np.array([row["box_name"] for row in rows])
             time_spent = np.array([float(row["time_spent (s)"]) for row in rows])
             distance = np.array([float(row["distance_traveled (m)"]) for row in rows])
             speed = np.array([float(row["average_speed (m/s)"]) for row in rows])
             
-            # Get unique box names
+            # Process data using original box names
             unique_boxes = np.unique(box_names)
-            
             for box_name in unique_boxes:
-                # Use numpy mask to filter data for this box
                 mask = box_names == box_name
                 box_data[box_name] = {
                     "time_spent": np.sum(time_spent[mask]),
@@ -1200,91 +1315,71 @@ def analyze_processed_data(output_dir):
                     "speed": np.mean(speed[mask])
                 }
             
-            # Calculate totals
             total_time = np.sum(time_spent)
             total_distance = np.sum(distance)
         
-        # Calculate mean speed overall
         mean_speed_overall = total_distance / total_time if total_time > 0 else 0
         
-        # Identify left, right, and central boxes
+        # Process box positions
         left_box = None
         right_box = None
         central_box = None
         
-        # Find box details file to determine box positions
-        box_details_file = None
-        for file in os.listdir(video_path):
-            if file.startswith("box_details_") and file.endswith(".csv"):
-                box_details_file = os.path.join(video_path, file)
-                break
-                
         if box_details_file:
             with open(box_details_file, 'r', newline='') as f:
                 reader = csv.DictReader(f)
                 boxes = list(reader)
                 
-                # Simple heuristic: sort boxes by x-coordinate and assign left/right/central
                 if len(boxes) >= 3:
-                    # Extract x-coordinate from the first point of each box
                     for box in boxes:
                         coords_str = box["coordinates"]
                         try:
-                            # Assuming format like "[(x1,y1), (x2,y2), ...]"
                             coords = np.array(eval(coords_str))
-                            # Calculate centroid using numpy mean
                             box["x_center"] = np.mean(coords[:, 0]) if coords.size > 0 else 0
                         except:
                             box["x_center"] = 0
                     
-                    # Sort by x-coordinate
                     sorted_boxes = sorted(boxes, key=lambda b: b["x_center"])
                     
+                    # Store original box names
                     left_box = sorted_boxes[0]["box_name"]
                     central_box = sorted_boxes[1]["box_name"] if len(sorted_boxes) > 2 else None
                     right_box = sorted_boxes[-1]["box_name"]
-                elif len(boxes) == 2:
-                    # With only two boxes, assume left and right
-                    left_box = boxes[0]["box_name"]
-                    right_box = boxes[1]["box_name"]
-                
-                # Store box coordinates in box_data for use in is_point_in_box
-                for box in boxes:
-                    box_name = box["box_name"]
-                    if box_name in box_data:
-                        try:
-                            box_data[box_name]["coords"] = eval(box["coordinates"])
-                        except:
-                            # If we can't parse the coordinates, create an empty list
-                            box_data[box_name]["coords"] = []
+                    
+                    # Store coordinates in box_data
+                    for box in boxes:
+                        box_name = box["box_name"]
+                        if box_name in box_data:
+                            try:
+                                box_data[box_name]["coords"] = eval(box["coordinates"])
+                            except:
+                                box_data[box_name]["coords"] = []
         
-        # Initialize visit counts
+        # Count visits using case-insensitive comparison
         left_visits = 0
         right_visits = 0
         current_box = None
-
-        # Read coordinates to count visits - use fish_coords_file instead of fish_data_file
-        if fish_coords_file and box_details_file:  # Only proceed if we have both files
+        
+        if fish_coords_file and box_details_file:
             with open(fish_coords_file, 'r', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    # Access the correct column names from the coordinates file
                     center_x = float(row['center_x (px)'])
                     center_y = float(row['center_y (px)'])
-
-                    # Determine which box the fish is in based on its coordinates
-                    if left_box and "coords" in box_data[left_box] and is_point_in_box((center_x, center_y), box_data[left_box]["coords"]):
-                        if current_box != left_box:
-                            left_visits += 1
-                            current_box = left_box
-                    elif right_box and "coords" in box_data[right_box] and is_point_in_box((center_x, center_y), box_data[right_box]["coords"]):
-                        if current_box != right_box:
-                            right_visits += 1
-                            current_box = right_box
-                    else:
-                        current_box = None  # Fish is not in any box
-
-        # Create data in vertical format for summary statistics
+                    
+                    # Use original box names from the mapping
+                    if left_box and left_box in box_data and "coords" in box_data[left_box]:
+                        if is_point_in_box((center_x, center_y), box_data[left_box]["coords"]):
+                            if current_box != left_box:
+                                left_visits += 1
+                                current_box = left_box
+                    if right_box and right_box in box_data and "coords" in box_data[right_box]:
+                        if is_point_in_box((center_x, center_y), box_data[right_box]["coords"]):
+                            if current_box != right_box:
+                                right_visits += 1
+                                current_box = right_box
+        
+        # Create summary statistics
         summary_data = [
             ["metric", "value"],
             ["video_name", video_name],
@@ -1304,7 +1399,6 @@ def analyze_processed_data(output_dir):
             ["number_of_visits_right_box", right_visits]
         ]
         
-        # Write summary statistics CSV in vertical format
         with open(summary_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerows(summary_data)

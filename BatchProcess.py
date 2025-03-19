@@ -37,7 +37,7 @@ def get_access_token():
     Acquire an access token for Microsoft Graph API using MSAL.
 
     Returns:
-        str: Access token.
+        str: Access token.z
     """
     result = app.acquire_token_for_client(scopes=SCOPE)
     return result['access_token']
