@@ -1265,6 +1265,8 @@ def analyze_processed_data(output_dir):
         # Create output files
         summary_file = os.path.join(video_path, "summary_statistics.csv")
         visits_file = os.path.join(video_path, "box_visits.csv")
+        crossings_file = os.path.join(video_path, "box_crossings.csv")
+        crossings_matrix_file = os.path.join(video_path, "box_crossings_matrix.csv")  # New matrix file
         
         # Find required files
         fish_data_file = None
@@ -1324,21 +1326,23 @@ def analyze_processed_data(output_dir):
         left_box = None
         right_box = None
         central_box = None
+        all_boxes = []
         
         if box_details_file:
             with open(box_details_file, 'r', newline='') as f:
                 reader = csv.DictReader(f)
                 boxes = list(reader)
                 
+                for box in boxes:
+                    coords_str = box["coordinates"]
+                    try:
+                        coords = np.array(eval(coords_str))
+                        box["x_center"] = np.mean(coords[:, 0]) if coords.size > 0 else 0
+                        all_boxes.append(box["box_name"])
+                    except:
+                        box["x_center"] = 0
+                
                 if len(boxes) >= 3:
-                    for box in boxes:
-                        coords_str = box["coordinates"]
-                        try:
-                            coords = np.array(eval(coords_str))
-                            box["x_center"] = np.mean(coords[:, 0]) if coords.size > 0 else 0
-                        except:
-                            box["x_center"] = 0
-                    
                     sorted_boxes = sorted(boxes, key=lambda b: b["x_center"])
                     
                     # Store original box names
@@ -1355,29 +1359,140 @@ def analyze_processed_data(output_dir):
                             except:
                                 box_data[box_name]["coords"] = []
         
-        # Count visits using case-insensitive comparison
-        left_visits = 0
-        right_visits = 0
+        # Track box visits and crossings with enhanced detail
+        box_visits = {box_name: 0 for box_name in all_boxes}
+        crossings = []  # Will store all crossings between boxes
         current_box = None
+        prev_frame = -1
+        min_frames_in_box = 3  # Minimum frames required in a box to count as a visit
+        frames_in_current_box = 0
+        
+        # Create a transition matrix to count movements between boxes
+        transition_matrix = {from_box: {to_box: 0 for to_box in all_boxes} for from_box in all_boxes}
         
         if fish_coords_file and box_details_file:
             with open(fish_coords_file, 'r', newline='') as f:
                 reader = csv.DictReader(f)
-                for row in reader:
-                    center_x = float(row['center_x (px)'])
-                    center_y = float(row['center_y (px)'])
+                rows = list(reader)
+                
+                # Get video FPS if available
+                video_fps = 30  # Default assumption
+                
+                # Group by frame to handle multiple contours per frame
+                frame_data = {}
+                for row in rows:
+                    frame = int(row['frame'])
+                    if frame not in frame_data:
+                        frame_data[frame] = []
+                    frame_data[frame].append(row)
+                
+                # Process frame by frame
+                for frame in sorted(frame_data.keys()):
+                    rows_in_frame = frame_data[frame]
                     
-                    # Use original box names from the mapping
-                    if left_box and left_box in box_data and "coords" in box_data[left_box]:
-                        if is_point_in_box((center_x, center_y), box_data[left_box]["coords"]):
-                            if current_box != left_box:
-                                left_visits += 1
-                                current_box = left_box
-                    if right_box and right_box in box_data and "coords" in box_data[right_box]:
-                        if is_point_in_box((center_x, center_y), box_data[right_box]["coords"]):
-                            if current_box != right_box:
-                                right_visits += 1
-                                current_box = right_box
+                    # Find the largest contour in this frame (likely the fish)
+                    largest_contour = max(rows_in_frame, key=lambda x: float(x.get('contour_area', 0)) 
+                                         if 'contour_area' in x else 0)
+                    
+                    center_x = float(largest_contour['center_x (px)'])
+                    center_y = float(largest_contour['center_y (px)'])
+                    speed = float(largest_contour['speed (m/s)'])
+                    
+                    # Determine which box the fish is in
+                    detected_box = None
+                    for box_name in all_boxes:
+                        if box_name in box_data and "coords" in box_data[box_name]:
+                            if is_point_in_box((center_x, center_y), box_data[box_name]["coords"]):
+                                detected_box = box_name
+                                break
+                    
+                    # If the fish is in a box
+                    if detected_box:
+                        # If this is a different box than before, we have a transition
+                        if current_box is not None and detected_box != current_box and frames_in_current_box >= min_frames_in_box:
+                            # Record the crossing
+                            crossing = {
+                                'frame': frame,
+                                'time': frame / video_fps,
+                                'from_box': current_box,
+                                'to_box': detected_box,
+                                'speed': speed,
+                                'position_x': center_x,
+                                'position_y': center_y
+                            }
+                            crossings.append(crossing)
+                            
+                            # Update transition matrix
+                            transition_matrix[current_box][detected_box] += 1
+                            
+                        # If this is a new box, count as a visit
+                        if detected_box != current_box:
+                            if frames_in_current_box >= min_frames_in_box:
+                                # Only count as a visit if we spent enough frames in the previous box
+                                box_visits[detected_box] += 1
+                            frames_in_current_box = 1
+                            current_box = detected_box
+                        else:
+                            frames_in_current_box += 1
+                    else:
+                        # Fish is outside any box
+                        if current_box is not None and frames_in_current_box >= min_frames_in_box:
+                            # Record leaving a box as a special crossing
+                            crossing = {
+                                'frame': frame,
+                                'time': frame / video_fps,
+                                'from_box': current_box,
+                                'to_box': 'outside',
+                                'speed': speed,
+                                'position_x': center_x,
+                                'position_y': center_y
+                            }
+                            crossings.append(crossing)
+                        
+                        current_box = None
+                        frames_in_current_box = 0
+                    
+                    prev_frame = frame
+        
+        # Save crossing data to CSV
+        with open(crossings_file, 'w', newline='') as f:
+            fieldnames = ['frame', 'time', 'from_box', 'to_box', 'speed', 'position_x', 'position_y']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for crossing in crossings:
+                writer.writerow(crossing)
+        
+        # Create a crossing matrix summary
+        with open(crossings_matrix_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            
+            # Write header row with destination boxes
+            header = ['From / To'] + all_boxes + ['outside']
+            writer.writerow(header)
+            
+            # Write transition counts for each source box
+            for from_box in all_boxes:
+                row = [from_box]  # First column is the source box
+                
+                # Add counts for transitions to each destination box
+                for to_box in all_boxes:
+                    row.append(transition_matrix.get(from_box, {}).get(to_box, 0))
+                
+                # Add count for transitions to outside
+                outside_count = sum(1 for c in crossings if c['from_box'] == from_box and c['to_box'] == 'outside')
+                row.append(outside_count)
+                
+                writer.writerow(row)
+            
+            # Add a summary row showing total transitions into each box
+            total_row = ['Total Entries']
+            for to_box in all_boxes:
+                total_entries = sum(transition_matrix.get(from_box, {}).get(to_box, 0) for from_box in all_boxes)
+                total_row.append(total_entries)
+            
+            # Add placeholder for total exits to "outside" 
+            total_row.append('-')
+            writer.writerow(total_row)
         
         # Create summary statistics
         summary_data = [
@@ -1395,16 +1510,37 @@ def analyze_processed_data(output_dir):
             ["distance_travelled_left_box", box_data.get(left_box, {}).get("distance", 0) if left_box else 0],
             ["distance_travelled_right_box", box_data.get(right_box, {}).get("distance", 0) if right_box else 0],
             ["distance_travelled_central_region", box_data.get(central_box, {}).get("distance", 0) if central_box else 0],
-            ["number_of_visits_left_box", left_visits],
-            ["number_of_visits_right_box", right_visits]
+            ["number_of_visits_left_box", box_visits.get(left_box, 0) if left_box else 0],
+            ["number_of_visits_right_box", box_visits.get(right_box, 0) if right_box else 0],
+            ["number_of_crossings_left_to_right", transition_matrix.get(left_box, {}).get(right_box, 0) if left_box and right_box else 0],
+            ["number_of_crossings_right_to_left", transition_matrix.get(right_box, {}).get(left_box, 0) if left_box and right_box else 0],
+            ["total_box_crossings", sum(crossing.get('to_box') != 'outside' for crossing in crossings)]
         ]
+        
+        # Add additional crossing metrics to summary
+        for from_box in all_boxes:
+            for to_box in all_boxes:
+                if from_box != to_box:
+                    crossing_key = f"crossings_{from_box.replace(' ', '_').lower()}_to_{to_box.replace(' ', '_').lower()}"
+                    crossing_value = transition_matrix.get(from_box, {}).get(to_box, 0)
+                    summary_data.append([crossing_key, crossing_value])
         
         with open(summary_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerows(summary_data)
         
+        # Save detailed visits data
+        with open(visits_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["box_name", "visits"])
+            for box_name, visits in box_visits.items():
+                writer.writerow([box_name, visits])
+        
         print(f"Analysis for {video_name} complete. Results saved to:")
         print(f"  - {summary_file}")
+        print(f"  - {visits_file}")
+        print(f"  - {crossings_file}")
+        print(f"  - {crossings_matrix_file}")  # Add this line
 
     print("All video analysis complete!")
 
