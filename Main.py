@@ -23,6 +23,8 @@ import re
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 import pickle
+from filterpy.kalman import KalmanFilter
+import math
 
 # Constants
 MAX_DISTANCE_THRESHOLD = 200 
@@ -32,10 +34,10 @@ RETINEX_SIGMA_LIST = [15, 80, 250]  # Multiple scales for MSR
 CLAHE_CLIP_LIMIT = 2.0
 CLAHE_GRID_SIZE = (8, 8)
 LAB_L_CLIP_LIMIT = 2.0
-MIN_FISH_AREA = 100  # Minimum area for fish detection
-MAX_FISH_AREA = 2000  # Maximum area for fish detection
+MIN_FISH_AREA = 25  # Reduce minimum area (from 100)
+MAX_FISH_AREA = 500  # Also reduce maximum area (from 2000)
 FISH_ASPECT_RATIO_RANGE = (0.3, 3.0)  # Expected fish shape ratio
-MOVEMENT_THRESHOLD = 5  # Minimum movement to consider as fish
+MOVEMENT_THRESHOLD = 3  # Lower movement threshold (from 5)
 HISTORY_LENGTH = 10  # Frames to keep in motion history
 
 def download_from_google_drive(file_id, destination=None):
@@ -458,8 +460,8 @@ def apply_adaptive_threshold(img, block_size=11, c=2):
     )
     return thresh
 
-def detect_fish(enhanced, bg_subtractor, min_contour_area=MIN_FISH_AREA, max_contour_area=MAX_FISH_AREA):
-    """Enhanced fish detection with multiple validation steps"""
+def detect_fish(enhanced, bg_subtractor, min_contour_area=MIN_FISH_AREA, max_contour_area=MAX_FISH_AREA, previous_contour=None, previous_center=None):
+    """Enhanced fish detection focused on tracking just one fish"""
     # Apply background subtraction with shadow detection
     fg_mask = bg_subtractor.apply(enhanced, learningRate=0.005)
     
@@ -469,15 +471,21 @@ def detect_fish(enhanced, bg_subtractor, min_contour_area=MIN_FISH_AREA, max_con
     # Noise reduction
     fg_mask = cv2.medianBlur(fg_mask, 5)
     
-    # Morphological operations
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Morphological operations - make kernel size resolution-dependent
+    kernel_size = 5 if min_contour_area < 150 else 7
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
     
     # Find contours
     contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    valid_contours = []
+    if not contours:
+        return [], None, 0.0
+    
+    # Score and filter contours
+    scored_contours = []
+    
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if min_contour_area < area < max_contour_area:
@@ -488,22 +496,95 @@ def detect_fish(enhanced, bg_subtractor, min_contour_area=MIN_FISH_AREA, max_con
             
             # Aspect ratio check
             aspect_ratio = min(width, height) / max(width, height) if max(width, height) > 0 else 0
+            
+            # Calculate a confidence score based on multiple factors
+            score = 0.0
+            
+            # Score based on aspect ratio (fish are usually slightly elongated)
+            ar_score = 0.0
             if FISH_ASPECT_RATIO_RANGE[0] <= aspect_ratio <= FISH_ASPECT_RATIO_RANGE[1]:
+                ar_target = 0.5  # Ideal aspect ratio for fish
+                ar_score = 1.0 - min(abs(aspect_ratio - ar_target), 0.5) / 0.5
+            
+            # Convexity check
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            solidity = float(area) / hull_area if hull_area > 0 else 0
+            
+            # Score for solidity (0.7-0.85 is ideal for fish)
+            sol_score = 0.0
+            if 0.5 < solidity < 0.95:
+                sol_ideal = 0.75
+                sol_score = 1.0 - min(abs(solidity - sol_ideal), 0.25) / 0.25
+            
+            # Perimeter and circularity
+            perimeter = cv2.arcLength(cnt, True)
+            circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+            
+            # Score for circularity (0.4-0.6 is ideal for fish)
+            circ_score = 0.0
+            if 0.2 < circularity < 0.8:
+                circ_ideal = 0.5
+                circ_score = 1.0 - min(abs(circularity - circ_ideal), 0.3) / 0.3
+            
+            # Area score - prefer mid-range areas
+            area_range = max_contour_area - min_contour_area
+            area_midpoint = min_contour_area + area_range / 2
+            area_score = 1.0 - min(abs(area - area_midpoint), area_range/2) / (area_range/2)
+            
+            # Position consistency score (if we have previous position)
+            pos_score = 0.0
+            if previous_center is not None:
+                # Get current center
+                M = cv2.moments(cnt)
+                if M["m00"] != 0:
+                    center_x = int(M["m10"] / M["m00"])
+                    center_y = int(M["m01"] / M["m00"])
+                    
+                    # Calculate distance to previous center
+                    dx = center_x - previous_center[0]
+                    dy = center_y - previous_center[1]
+                    distance = np.sqrt(dx**2 + dy**2)
+                    
+                    # Score based on distance (closer is better)
+                    max_expected_movement = 100  # Maximum reasonable movement between frames
+                    if distance <= max_expected_movement:
+                        pos_score = 1.0 - (distance / max_expected_movement)
+                    
+            # Combined confidence score (weighted average)
+            weight_ar = 0.2     # Aspect ratio weight
+            weight_sol = 0.15   # Solidity weight
+            weight_circ = 0.15  # Circularity weight
+            weight_area = 0.2   # Area weight
+            weight_pos = 0.3    # Position consistency weight
+            
+            # If we don't have position history, redistribute the weights
+            if previous_center is None:
+                weight_ar = 0.3
+                weight_sol = 0.2
+                weight_circ = 0.2
+                weight_area = 0.3
+                weight_pos = 0.0
                 
-                # Convexity check
-                hull = cv2.convexHull(cnt)
-                hull_area = cv2.contourArea(hull)
-                solidity = float(area) / hull_area if hull_area > 0 else 0
-                
-                # Perimeter and circularity
-                perimeter = cv2.arcLength(cnt, True)
-                circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
-                
-                # Combined shape validation
-                if 0.5 < solidity < 0.95 and 0.2 < circularity < 0.8:
-                    valid_contours.append(cnt)
+            score = (ar_score * weight_ar + 
+                     sol_score * weight_sol + 
+                     circ_score * weight_circ + 
+                     area_score * weight_area + 
+                     pos_score * weight_pos)
+            
+            scored_contours.append((cnt, score, area))
     
-    return valid_contours
+    # Sort contours by score (highest first)
+    scored_contours.sort(key=lambda x: x[1], reverse=True)
+    
+    # If we have valid contours, return the highest scored one
+    if scored_contours:
+        best_contour = scored_contours[0][0]
+        best_score = scored_contours[0][1]
+        best_area = scored_contours[0][2]
+        return [best_contour], best_contour, best_score
+    
+    return [], None, 0.0
 
 def preprocess_frame(frame, brightness_increase, clahe, scale_factor=0.5):
     """Enhanced preprocessing with better noise handling"""
@@ -689,7 +770,7 @@ def write_center_data(center_writer, frame_count, idx, center_x, center_y, speed
     """
     center_writer.writerow([frame_count, idx, center_x, center_y, speed])
 
-def create_tank_mask(frame, points=None):
+def create_tank_mask(frame, points=None, scale_factor=1.0):
     """
     Create a binary mask for the tank area.
 
@@ -699,56 +780,99 @@ def create_tank_mask(frame, points=None):
     Args:
         frame (np.array): Input video frame.
         points (list, optional): List of points defining the tank boundary. Defaults to None.
+        scale_factor (float, optional): Scale factor for display and interactive selection.
 
     Returns:
         tuple: Binary mask where tank area is white (255) and outside area is black (0),
                and the list of points defining the mask.
     """
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    h, w = frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
 
     if points is None:
-        clone = frame.copy()
-        cv2.namedWindow("Define Tank Area")
+        # For better visualization, resize large frames
+        display_scale = 1.0 if scale_factor >= 1.0 else 1.0/scale_factor
+        if display_scale != 1.0:
+            display_frame = cv2.resize(frame, None, fx=display_scale, fy=display_scale)
+        else:
+            display_frame = frame.copy()
+            
+        cv2.namedWindow("Define Tank Area", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Define Tank Area", min(w, 1024), min(h, 768))
+        
         points = []
 
         def click_and_crop(event, x, y, flags, param):
+            nonlocal points, display_frame, display_scale
+            
             if event == cv2.EVENT_LBUTTONDOWN:
-                points.append((x, y))
+                # Convert clicked point back to original frame coordinates
+                original_x = int(x / display_scale) if display_scale != 1.0 else x
+                original_y = int(y / display_scale) if display_scale != 1.0 else y
+                
+                points.append((original_x, original_y))
+                
+                # Draw on the display frame
                 if len(points) > 1:
-                    cv2.line(clone, points[-2], points[-1], (0, 255, 0), 2)
-                    cv2.imshow("Define Tank Area", clone)
+                    p1 = (int(points[-2][0] * display_scale), int(points[-2][1] * display_scale))
+                    p2 = (int(points[-1][0] * display_scale), int(points[-1][1] * display_scale))
+                    cv2.line(display_frame, p1, p2, (0, 255, 0), 2)
+                    cv2.imshow("Define Tank Area", display_frame)
+                    
+                # Draw the point
+                cv2.circle(display_frame, (x, y), 3, (0, 0, 255), -1)
+                cv2.imshow("Define Tank Area", display_frame)
 
         cv2.setMouseCallback("Define Tank Area", click_and_crop)
+        
+        # Instructions
+        instructions = "Click to define tank boundary. Press 'c' when complete."
+        font_scale = 0.6 * display_scale
+        cv2.putText(display_frame, instructions, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2)
+        cv2.imshow("Define Tank Area", display_frame)
 
         while True:
-            cv2.imshow("Define Tank Area", clone)
             key = cv2.waitKey(1) & 0xFF
 
             if (key == ord("c") or key == ord("C")) and len(points) > 2:
-                cv2.line(clone, points[0], points[-1], (0, 255, 0), 2)
-                cv2.imshow("Define Tank Area", clone)
+                # Draw the closing line
+                p1 = (int(points[0][0] * display_scale), int(points[0][1] * display_scale))
+                p2 = (int(points[-1][0] * display_scale), int(points[-1][1] * display_scale))
+                cv2.line(display_frame, p1, p2, (0, 255, 0), 2)
+                cv2.imshow("Define Tank Area", display_frame)
+                cv2.waitKey(500)  # Show completed polygon briefly
                 break
 
         cv2.destroyWindow("Define Tank Area")
-    else:
-        if len(points) > 2:
-            pts = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(mask, [pts], 255)
+
+    # Create the mask using the points (original frame coordinates)
+    if len(points) > 2:
+        pts = np.array(points, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.fillPoly(mask, [pts], 255)
 
     return mask, points
 
-def apply_tank_mask(frame, mask):
+def apply_tank_mask(frame, mask, scale_factor=1.0):
     """
     Apply tank mask to the frame.
 
     Args:
         frame (np.array): Input frame.
         mask (np.array): Tank mask.
+        scale_factor (float, optional): Scaling factor for resolution adjustment.
 
     Returns:
         np.array: Frame with tank mask applied.
     """
-    return cv2.bitwise_and(frame, frame, mask=mask)
+    # Ensure mask is properly sized for the frame
+    if frame.shape[:2] != mask.shape[:2]:
+        h, w = frame.shape[:2]
+        resized_mask = cv2.resize(mask, (w, h))
+    else:
+        resized_mask = mask
+        
+    return cv2.bitwise_and(frame, frame, mask=resized_mask)
 
 def is_fish_movement_valid(current_center, previous_center, previous_valid_center, max_distance):
     """
@@ -767,19 +891,34 @@ def is_fish_movement_valid(current_center, previous_center, previous_valid_cente
     if previous_center is None:
         return True, current_center
 
+    # Calculate pixel distance between current and previous position
     dx = current_center[0] - previous_center[0]
     dy = current_center[1] - previous_center[1]
     distance = np.sqrt(dx**2 + dy**2)
 
+    # If movement is within threshold, consider it valid
     if distance <= max_distance:
         return True, current_center
-
+    
+    # For larger movements, apply additional validation
+    # Using velocity consistency check if we have multiple previous positions
+    if previous_valid_center and previous_center:
+        # Calculate previous movement vector
+        prev_dx = previous_center[0] - previous_valid_center[0]
+        prev_dy = previous_center[1] - previous_valid_center[1]
+        
+        # Check if current movement is in similar direction (using dot product)
+        if prev_dx * dx + prev_dy * dy > 0 and distance <= max_distance * 1.5:
+            # Movement is in consistent direction, might be valid even if faster
+            return True, current_center
+    
+    # Movement failed validation
     return False, previous_valid_center
 
 def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, current_center, previous_center,
                        distance=None, instantaneous_speed=None, is_valid_movement=True,
                        is_outside_tank=False, is_showing_previous=False, reflection_detected=False, 
-                       status_text=None, cumulative_speed=None, window_size=1.0):
+                       status_text=None, cumulative_speed=None, window_size=1.0, scale_factor=1.0, is_prediction=False):
     """
     Visualize the processing steps in separate windows.
 
@@ -801,46 +940,68 @@ def visualize_processing(original, masked, enhanced, fg_mask, edges, fish_vis, c
         status_text (str, optional): Status text to display on visualization. Defaults to None.
         cumulative_speed (float, optional): Speed calculated over a window of frames.
         window_size (float, optional): Size of the window in seconds.
+        scale_factor (float, optional): Scale factor for display. Defaults to 1.0.
+        is_prediction (bool, optional): Whether the current detection is a prediction. Defaults to False.
 
     Returns:
         int: Key pressed by user (for handling quit).
     """
-    cv2.imshow("Original", original)
-    cv2.imshow("Masked", masked)
+    # Resize frames for display if needed
+    display_scale = 1.0 if scale_factor >= 1.0 else 1.0/scale_factor
+    
+    if display_scale != 1.0:
+        display_original = cv2.resize(original, None, fx=display_scale, fy=display_scale)
+        display_masked = cv2.resize(masked, None, fx=display_scale, fy=display_scale)
+        # Don't resize enhanced and binary images since they might already be at processing resolution
+        display_fish_vis = cv2.resize(fish_vis, None, fx=display_scale, fy=display_scale)
+    else:
+        display_original = original
+        display_masked = masked
+        display_fish_vis = fish_vis
+    
+    cv2.imshow("Original", display_original)
+    cv2.imshow("Masked", display_masked)
     cv2.imshow("Enhanced", enhanced)
     cv2.imshow("Background Mask", fg_mask)
     cv2.imshow("Edges", edges)
 
     if current_center and previous_center:
-        cv2.line(fish_vis, previous_center, current_center, (255, 255, 0), 2)
+        # Draw trajectory line on fish_vis
+        cv2.line(display_fish_vis, previous_center, current_center, (255, 255, 0), 2)
 
     if current_center:
+        radius = int(5 * display_scale)  # Scale circle radius based on display scale
+        thickness = int(max(1, 2 * display_scale))  # Scale line thickness
+        font_scale = 0.7 * display_scale  # Scale font size
+        
         if reflection_detected:
-            cv2.circle(fish_vis, current_center, 8, (0, 255, 255), -1)  # Yellow for reflection
-            cv2.putText(fish_vis, "Reflection detected", (10, 120),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.circle(display_fish_vis, current_center, radius, (0, 255, 255), -1)
+            cv2.putText(display_fish_vis, "Reflection detected", (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), thickness)
         elif is_outside_tank:
-            cv2.circle(fish_vis, current_center, 8, (0, 0, 255), -1)
-            cv2.putText(fish_vis, "Detection outside tank", (10, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.circle(display_fish_vis, current_center, radius, (0, 0, 255), -1)
+            cv2.putText(display_fish_vis, "Detection outside tank", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
         elif is_showing_previous:
-            cv2.circle(fish_vis, current_center, 8, (0, 0, 255), -1)
-            cv2.putText(fish_vis, "Using previous position", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.circle(display_fish_vis, current_center, radius, (0, 0, 255), -1)
+            cv2.putText(display_fish_vis, "Using previous position", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
         else:
-            cv2.circle(fish_vis, current_center, 5, (255, 0, 0), -1)
+            cv2.circle(display_fish_vis, current_center, radius, (255, 0, 0), -1)
 
     # Only show cumulative speed (remove instantaneous speed display)
     if cumulative_speed is not None:
         speed_text = f"Avg Speed ({window_size:.1f}s): {cumulative_speed:.4f} m/s"
-        cv2.putText(fish_vis, speed_text, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display_fish_vis, speed_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7 * display_scale, (0, 255, 0), 
+                    int(max(1, 2 * display_scale)))
     
     if status_text:
-        cv2.putText(fish_vis, status_text, (10, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(display_fish_vis, status_text, (10, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7 * display_scale, (255, 255, 255), 
+                    int(max(1, 2 * display_scale)))
 
-    cv2.imshow("Detected Fish", fish_vis)
+    cv2.imshow("Detected Fish", display_fish_vis)
 
     return cv2.waitKey(1) & 0xFF
 
@@ -916,6 +1077,31 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
     check_video_path(video_path)
     cap = initialize_video_capture(video_path)
     log_video_info(cap)
+
+    # Get video dimensions
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Calculate appropriate scale factor based on resolution
+    # For HD (1920x1080) or higher, use 0.5 scale, otherwise use 1.0
+    base_resolution = 1280 * 720  # 720p reference resolution
+    current_resolution = frame_width * frame_height
+    scale_factor = 0.5 if current_resolution > base_resolution else 1.0
+    
+    # Scale thresholds based on resolution ratio compared to base resolution
+    resolution_factor = current_resolution / base_resolution if scale_factor == 1.0 else 1.0
+    
+    # Adjust area thresholds based on resolution
+    min_contour_area = int(MIN_FISH_AREA * resolution_factor)
+    max_contour_area = int(MAX_FISH_AREA * resolution_factor)
+    
+    # Adjust distance threshold based on resolution
+    max_distance_threshold = int(MAX_DISTANCE_THRESHOLD * math.sqrt(resolution_factor))
+    
+    print(f"Using resolution factor: {resolution_factor:.2f}")
+    print(f"Adjusted min contour area: {min_contour_area}")
+    print(f"Adjusted max contour area: {max_contour_area}")
+    print(f"Adjusted max distance threshold: {max_distance_threshold}")
 
     box_manager = BoxManager()
     
@@ -1018,7 +1204,7 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
 
             # Use provided tank_points or prompt user
             if tank_points is None:
-                tank_mask, tank_points = create_tank_mask(first_frame)
+                tank_mask, tank_points = create_tank_mask(first_frame, scale_factor=scale_factor)
             else:
                 tank_mask, _ = create_tank_mask(first_frame, points=tank_points)
             
@@ -1033,23 +1219,31 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                 cv2.namedWindow("Background Mask", cv2.WINDOW_NORMAL)
                 cv2.namedWindow("Edges", cv2.WINDOW_NORMAL)
                 cv2.namedWindow("Detected Fish", cv2.WINDOW_NORMAL)
-
-                cv2.resizeWindow("Original", 640, 480)
-                cv2.resizeWindow("Masked", 640, 480)
-                cv2.resizeWindow("Enhanced", 640, 480)
-                cv2.resizeWindow("Background Mask", 640, 480)
-                cv2.resizeWindow("Edges", 640, 480)
-                cv2.resizeWindow("Detected Fish", 640, 480)
+                
+                # Calculate display size based on video resolution and screen size
+                # This will make windows proportionally sized and fit to screen
+                display_width = min(frame_width, 800)  # Cap at 800 pixels for high-res videos
+                display_height = int(display_width * frame_height / frame_width)
+                
+                cv2.resizeWindow("Original", display_width, display_height)
+                cv2.resizeWindow("Masked", display_width, display_height)
+                cv2.resizeWindow("Enhanced", display_width, display_height)
+                cv2.resizeWindow("Background Mask", display_width, display_height)
+                cv2.resizeWindow("Edges", display_width, display_height)
+                cv2.resizeWindow("Detected Fish", display_width, display_height)
 
             previous_valid_center = None
             previous_valid_contour = None
+
+            kalman_filter = initialize_kalman_filter(resolution_factor)
+            kalman_initialized = False
 
             while True:
                 ret, frame = cap.read()
                 if not ret or frame_count >= max_frames:
                     break
 
-                masked_frame = apply_tank_mask(frame, tank_mask)
+                masked_frame = apply_tank_mask(frame, tank_mask, scale_factor)
 
                 if scale_factor != 1.0:
                     frame_resized = cv2.resize(masked_frame, None, fx=scale_factor, fy=scale_factor)
@@ -1075,11 +1269,20 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                 contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
                 valid_contours = []
-                for cnt in contours:
-                    area = cv2.contourArea(cnt)
-
-                    if min_contour_area < area < 1350:
-                        valid_contours.append(cnt)
+                if contours:
+                    # Find the single largest contour that meets the area criteria
+                    filtered_contours = []
+                    for cnt in contours:
+                        area = cv2.contourArea(cnt)
+                        if min_contour_area < area < max_contour_area:
+                            filtered_contours.append((cnt, area))
+                    
+                    # If we found any valid contours, keep only the largest one
+                    if filtered_contours:
+                        largest_contour, largest_area = max(filtered_contours, key=lambda x: x[1])
+                        valid_contours = [largest_contour]
+                        if enable_visualization:
+                            print(f"Frame {frame_count}: Largest contour area = {largest_area}")
 
                 fish_vis = None
                 if enable_visualization:
@@ -1106,6 +1309,7 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                 is_outside_tank = False
                 is_showing_previous = False
                 is_reflection_detected = False
+                is_prediction = False  # Add this line to initialize the variable
 
                 if valid_contours:
                     largest_contour = max(valid_contours, key=cv2.contourArea)
@@ -1133,7 +1337,7 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                                     current_center,
                                     previous_center,
                                     previous_valid_center if previous_valid_center else current_center,
-                                    MAX_DISTANCE_THRESHOLD
+                                    max_distance_threshold  # Use adjusted threshold
                                 )
 
                                 if is_valid_movement:
@@ -1191,13 +1395,18 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
                             status_text = "Detection outside tank"
                         elif is_showing_previous:
                             status_text = "Using previous position"
+                        elif is_prediction:
+                            status_text = "Using prediction"
                         
                         key = visualize_processing(
                             frame, masked_frame, enhanced, fg_mask, edges, fish_vis,
-                            current_center, previous_center, distance, None,  # Pass None for instantaneous_speed
-                            not is_showing_previous, is_outside_tank, is_showing_previous,
-                            reflection_detected=is_reflection_detected, status_text=status_text,
-                            cumulative_speed=cumulative_speed, window_size=speed_window_size/original_fps
+                            current_center, previous_center, distance, None,
+                            not (is_showing_previous or is_prediction), is_outside_tank, 
+                            is_showing_previous, reflection_detected=is_reflection_detected, 
+                            status_text=status_text, cumulative_speed=cumulative_speed, 
+                            window_size=speed_window_size/original_fps,
+                            scale_factor=scale_factor,
+                            is_prediction=is_prediction
                         )
                         if key == ord('q'):
                             break
@@ -1205,20 +1414,15 @@ def process_video(video_path, output_dir, box_data=None, tank_points=None, enabl
 
                 previous_center = current_center
 
-                contour_areas = []
-                for idx, contour in enumerate(valid_contours):
-                    area = cv2.contourArea(contour)
-                    contour_areas.append(area)
-                    M = cv2.moments(contour)
-                    if M["m00"] != 0:
-                        center_x = int(M["m10"] / M["m00"])
-                        center_y = int(M["m01"] / M["m00"])
-                        # Just use cumulative speed
-                        write_center_data(center_writer, frame_count, idx, center_x, center_y, cumulative_speed)
-
+                if current_center:
+                    # Log only the main tracked fish (which is already the largest contour)
+                    write_center_data(center_writer, frame_count, 0, current_center[0], current_center[1], cumulative_speed)
+                
+                # For visualization, we only need to pass the single contour:
+                contour_area = cv2.contourArea(current_contour) if current_contour is not None else 0
                 draw_fish_contours(enhanced, valid_contours, list(box_data.values()), 
                                   time_spent, distance_in_box, prev_box_positions, 
-                                  original_fps, frame_count, contour_areas=contour_areas)
+                                  original_fps, frame_count, contour_areas=[contour_area])
 
                 pbar.update(1)
                 frame_count += 1
@@ -1367,6 +1571,10 @@ def analyze_processed_data(output_dir):
         min_frames_in_box = 3  # Minimum frames required in a box to count as a visit
         frames_in_current_box = 0
         
+        # Add trajectory tracking for more accurate box detection
+        position_history = []  # Will store (frame, x, y) positions
+        trajectory_window = 5  # Consider this many frames for trajectory analysis
+        
         # Create a transition matrix to count movements between boxes
         transition_matrix = {from_box: {to_box: 0 for to_box in all_boxes} for from_box in all_boxes}
         
@@ -1398,13 +1606,18 @@ def analyze_processed_data(output_dir):
                     center_y = float(largest_contour['center_y (px)'])
                     speed = float(largest_contour['speed (m/s)'])
                     
-                    # Determine which box the fish is in
-                    detected_box = None
-                    for box_name in all_boxes:
-                        if box_name in box_data and "coords" in box_data[box_name]:
-                            if is_point_in_box((center_x, center_y), box_data[box_name]["coords"]):
-                                detected_box = box_name
-                                break
+                    # Add to position history
+                    position_history.append((frame, center_x, center_y))
+                    # Keep only recent history
+                    while len(position_history) > trajectory_window:
+                        position_history.pop(0)
+                    
+                    # Use trajectory to determine current box more reliably
+                    detected_box = determine_current_box_with_trajectory(
+                        position_history, 
+                        all_boxes, 
+                        box_data
+                    )
                     
                     # If the fish is in a box
                     if detected_box:
@@ -1818,6 +2031,122 @@ def setup_google_credentials():
         return True
     
     return False
+
+def determine_current_box_with_trajectory(position_history, all_boxes, box_data):
+    """
+    Use trajectory information to more reliably determine which box the fish is in.
+    
+    Args:
+        position_history (list): List of (frame, x, y) tuples for recent positions
+        all_boxes (list): List of box names
+        box_data (dict): Dictionary containing box information
+        
+    Returns:
+        str: Name of the detected box, or None if fish is not in any box
+    """
+    if len(position_history) < 2:
+        # Not enough trajectory data, use simple point-in-box check
+        current_pos = position_history[-1]
+        center_x, center_y = current_pos[1], current_pos[2]
+        
+        for box_name in all_boxes:
+            if box_name in box_data and "coords" in box_data[box_name]:
+                if is_point_in_box((center_x, center_y), box_data[box_name]["coords"]):
+                    return box_name
+        return None
+    
+    # Get current position and direction
+    current_pos = position_history[-1]
+    prev_pos = position_history[-2]
+    
+    center_x, center_y = current_pos[1], current_pos[2]
+    prev_x, prev_y = prev_pos[1], prev_pos[2]
+    
+    # Calculate direction vector
+    dx = center_x - prev_x
+    dy = center_y - prev_y
+    
+    # Check current position first
+    current_box = None
+    for box_name in all_boxes:
+        if box_name in box_data and "coords" in box_data[box_name]:
+            if is_point_in_box((center_x, center_y), box_data[box_name]["coords"]):
+                current_box = box_name
+                break
+    
+    # If we're in a box, return it
+    if current_box:
+        return current_box
+    
+    # For fast-moving fish that might "skip" a box between frames,
+    # check if the trajectory passes through any box
+    if abs(dx) > 20 or abs(dy) > 20:  # Only for significant movements
+        # Create a few interpolated points along the trajectory
+        points_to_check = 5
+        for i in range(1, points_to_check):
+            # Check points along the trajectory
+            check_x = prev_x + (dx * i / points_to_check)
+            check_y = prev_y + (dy * i / points_to_check)
+            
+            for box_name in all_boxes:
+                if box_name in box_data and "coords" in box_data[box_name]:
+                    if is_point_in_box((check_x, check_y), box_data[box_name]["coords"]):
+                        return box_name
+    
+    return None
+
+def initialize_kalman_filter(resolution_factor=1.0):
+    """
+    Initialize a Kalman filter for tracking fish movement.
+    
+    Args:
+        resolution_factor (float): Factor to adjust parameters based on video resolution
+    
+    Returns:
+        KalmanFilter: Configured Kalman filter object
+    """
+    kf = KalmanFilter(dim_x=4, dim_z=2)  # State: [x, y, dx, dy], Measurement: [x, y]
+    
+    # State transition matrix (physics model)
+    kf.F = np.array([
+        [1, 0, 1, 0],  # x = x + dx
+        [0, 1, 0, 1],  # y = y + dy
+        [0, 0, 1, 0],  # dx = dx
+        [0, 0, 0, 1]   # dy = dy
+    ])
+    
+    # Measurement function (we only measure position, not velocity)
+    kf.H = np.array([
+        [1, 0, 0, 0],
+        [0, 1, 0, 0]
+    ])
+    
+    # Measurement noise - adjust based on resolution
+    meas_noise = 10 * resolution_factor
+    kf.R = np.array([
+        [meas_noise, 0],
+        [0, meas_noise]
+    ])
+    
+    # Process noise - adjust based on resolution
+    process_noise = 0.1 * resolution_factor
+    kf.Q = np.array([
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 10, 0],  # Higher uncertainty for velocity
+        [0, 0, 0, 10]
+    ]) * process_noise
+    
+    # Initial state uncertainty - adjust based on resolution
+    init_uncertainty = 100 * resolution_factor
+    kf.P = np.array([
+        [init_uncertainty, 0, 0, 0],
+        [0, init_uncertainty, 0, 0],
+        [0, 0, init_uncertainty, 0],
+        [0, 0, 0, init_uncertainty]
+    ])
+    
+    return kf
 
 def main():
     """
