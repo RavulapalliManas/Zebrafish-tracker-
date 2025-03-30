@@ -25,6 +25,8 @@ from google.auth.transport.requests import Request
 import pickle
 from filterpy.kalman import KalmanFilter
 import math
+import datetime
+import traceback
 
 # Constants
 MAX_DISTANCE_THRESHOLD = 200 
@@ -40,67 +42,118 @@ FISH_ASPECT_RATIO_RANGE = (0.3, 3.0)  # Expected fish shape ratio
 MOVEMENT_THRESHOLD = 3  # Lower movement threshold (from 5)
 HISTORY_LENGTH = 10  # Frames to keep in motion history
 
-def download_from_google_drive(file_id, destination=None):
+def download_from_google_drive(file_id, destination=None, max_retries=3, timeout=300):
     """
-    Download a file from Google Drive.
+    Download a file from Google Drive with improved progress tracking and error handling.
     
     Args:
         file_id (str): The ID of the file to download.
         destination (str, optional): The path where the file will be saved.
                                     If None, will use the original filename.
+        max_retries (int, optional): Maximum number of retry attempts. Defaults to 3.
+        timeout (int, optional): Timeout in seconds for the download attempt. Defaults to 300.
     
     Returns:
-        tuple: (bool, str) - Success status and the path where the file was saved.
+        tuple: (bool, str, dict) - Success status, the path where the file was saved, and download stats.
     """
-    try:
-        # Load credentials from environment
-        creds_json = os.environ.get('GOOGLE_CREDENTIALS')
-        if not creds_json:
-            print("Google credentials not found. Please run setup_google_credentials() first.")
-            return False, None
+    stats = {
+        "success": False,
+        "attempts": 0,
+        "error": None,
+        "final_size": 0,
+        "download_speed": 0
+    }
+    
+    for attempt in range(max_retries):
+        stats["attempts"] += 1
+        start_time = time.time()
+        
+        try:
+            # Load credentials from environment
+            creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+            if not creds_json:
+                stats["error"] = "Google credentials not found. Please run setup_google_credentials() first."
+                print(stats["error"])
+                return False, None, stats
+                
+            creds_data = json.loads(creds_json)
             
-        creds_data = json.loads(creds_json)
-        
-        # Create credentials object
-        creds = Credentials(
-            token=creds_data.get('token'),
-            refresh_token=creds_data.get('refresh_token'),
-            token_uri=creds_data.get('token_uri'),
-            client_id=creds_data.get('client_id'),
-            client_secret=creds_data.get('client_secret'),
-            scopes=creds_data.get('scopes')
-        )
-        
-        # Build the Drive API client
-        service = build('drive', 'v3', credentials=creds)
-        
-        # Get file metadata to retrieve the original filename
-        file_metadata = service.files().get(fileId=file_id, fields="name").execute()
-        original_filename = file_metadata.get('name', 'downloaded_file')
-        
-        # If destination is not specified, use the original filename
-        if destination is None:
-            destination = os.path.join(os.getcwd(), original_filename)
-        
-        # Create a BytesIO object to store the downloaded file
-        request = service.files().get_media(fileId=file_id)
-        file_handle = io.BytesIO()
-        downloader = MediaIoBaseDownload(file_handle, request)
-        
-        # Download the file
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-            print(f"Download {int(status.progress() * 100)}%")
-        
-        # Save the file to the destination
-        with open(destination, 'wb') as f:
-            f.write(file_handle.getvalue())
+            # Create credentials object
+            creds = Credentials(
+                token=creds_data.get('token'),
+                refresh_token=creds_data.get('refresh_token'),
+                token_uri=creds_data.get('token_uri'),
+                client_id=creds_data.get('client_id'),
+                client_secret=creds_data.get('client_secret'),
+                scopes=creds_data.get('scopes')
+            )
             
-        return True, destination
-    except Exception as e:
-        print(f"Error downloading from Google Drive: {e}")
-        return False, None
+            # Build the Drive API client
+            service = build('drive', 'v3', credentials=creds)
+            
+            # Get file metadata to retrieve the original filename and file size
+            file_metadata = service.files().get(fileId=file_id, fields="name,size").execute()
+            original_filename = file_metadata.get('name', 'downloaded_file')
+            file_size = int(file_metadata.get('size', 0))
+            
+            # If destination is not specified, use the original filename
+            if destination is None:
+                destination = os.path.join(os.getcwd(), original_filename)
+            
+            print(f"Downloading file: {original_filename} (Size: {file_size/(1024*1024):.2f} MB)")
+            
+            # Create a BytesIO object to store the downloaded file
+            request = service.files().get_media(fileId=file_id)
+            file_handle = io.BytesIO()
+            downloader = MediaIoBaseDownload(file_handle, request)
+            
+            # Download the file with progress tracking
+            done = False
+            last_progress = 0
+            while not done:
+                status, done = downloader.next_chunk(timeout=timeout)
+                progress = int(status.progress() * 100)
+                
+                # Only print if progress has changed significantly to avoid console spam
+                if progress >= last_progress + 5 or progress == 100:
+                    elapsed_time = time.time() - start_time
+                    downloaded_size = file_size * status.progress()
+                    speed = downloaded_size / (1024 * 1024 * elapsed_time) if elapsed_time > 0 else 0
+                    eta = (file_size - downloaded_size) / (speed * 1024 * 1024) if speed > 0 else 0
+                    
+                    print(f"Download progress: {progress}% - {downloaded_size/(1024*1024):.2f} MB / {file_size/(1024*1024):.2f} MB "
+                          f"(Speed: {speed:.2f} MB/s, ETA: {eta:.1f} seconds)")
+                    last_progress = progress
+            
+            # Calculate final download stats
+            total_time = time.time() - start_time
+            stats["download_speed"] = file_size / (1024 * 1024 * total_time) if total_time > 0 else 0
+            stats["final_size"] = file_size
+            
+            # Save the file to the destination
+            with open(destination, 'wb') as f:
+                f.write(file_handle.getvalue())
+            
+            print(f"Successfully downloaded {original_filename} to {destination} "
+                  f"({file_size/(1024*1024):.2f} MB in {total_time:.1f} seconds, Avg speed: {stats['download_speed']:.2f} MB/s)")
+            
+            stats["success"] = True
+            return True, destination, stats
+        
+        except Exception as e:
+            error_message = f"Error downloading from Google Drive (attempt {attempt+1}/{max_retries}): {str(e)}"
+            stats["error"] = str(e)
+            print(error_message)
+            
+            if attempt < max_retries - 1:
+                retry_delay = (attempt + 1) * 5  # Progressive backoff (5s, 10s, 15s...)
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print(f"Failed to download after {max_retries} attempts.")
+                return False, None, stats
+    
+    return False, None, stats
 
 def download_from_onedrive(file_url, destination):
     """
@@ -138,13 +191,13 @@ def download_from_onedrive(file_url, destination):
 
 def get_video_files_from_google_drive(folder_id):
     """
-    Get a list of video files from a Google Drive folder.
+    Get a list of video files from a Google Drive folder with enhanced metadata.
     
     Args:
         folder_id (str): The ID of the folder to search.
     
     Returns:
-        list: A list of dictionaries containing file IDs and names.
+        list: A list of dictionaries containing file IDs, names, sizes, creation dates, and other metadata.
     """
     try:
         # Load credentials from environment
@@ -168,14 +221,93 @@ def get_video_files_from_google_drive(folder_id):
         # Build the Drive API client
         service = build('drive', 'v3', credentials=creds)
         
-        # Query for video files in the folder
-        query = f"'{folder_id}' in parents and (mimeType contains 'video/')"
-        results = service.files().list(q=query, fields="files(id, name)").execute()
+        print("Retrieving file list from Google Drive folder...")
         
-        return results.get('files', [])
+        # Query for video files in the folder with additional metadata
+        query = f"'{folder_id}' in parents and (mimeType contains 'video/') and trashed=false"
+        fields = "nextPageToken, files(id, name, size, createdTime, modifiedTime, mimeType, md5Checksum)"
+        
+        # Use pagination to retrieve all files
+        all_files = []
+        page_token = None
+        
+        while True:
+            results = service.files().list(
+                q=query,
+                spaces='drive',
+                fields=fields,
+                pageToken=page_token,
+                pageSize=100
+            ).execute()
+            
+            files = results.get('files', [])
+            all_files.extend(files)
+            
+            # Get the page token for the next page of files
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                break
+        
+        # Format file sizes and dates for better readability
+        for file in all_files:
+            if 'size' in file:
+                size_bytes = int(file['size'])
+                file['size_bytes'] = size_bytes
+                file['size_formatted'] = format_file_size(size_bytes)
+            else:
+                file['size_bytes'] = 0
+                file['size_formatted'] = 'Unknown'
+                
+            if 'createdTime' in file:
+                file['created_formatted'] = format_datetime(file['createdTime'])
+            
+            if 'modifiedTime' in file:
+                file['modified_formatted'] = format_datetime(file['modifiedTime'])
+        
+        # Sort files by name for more consistent processing
+        all_files.sort(key=lambda f: f.get('name', ''))
+        
+        if all_files:
+            print(f"Found {len(all_files)} video files in Google Drive folder.")
+            
+            # Display a table with file information
+            print("\nFile List:")
+            print(f"{'Name':<40} {'Size':<10} {'Created':<20}")
+            print("-" * 72)
+            
+            for file in all_files:
+                print(f"{file.get('name', 'Unknown'):<40} "
+                      f"{file.get('size_formatted', 'Unknown'):<10} "
+                      f"{file.get('created_formatted', 'Unknown'):<20}")
+            print()
+        else:
+            print("No video files found in the specified Google Drive folder.")
+            
+        return all_files
     except Exception as e:
         print(f"Error getting files from Google Drive: {e}")
         return []
+
+def format_file_size(size_bytes):
+    """Format file size in human-readable form."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes/1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes/(1024*1024):.1f} MB"
+    else:
+        return f"{size_bytes/(1024*1024*1024):.2f} GB"
+
+def format_datetime(datetime_str):
+    """Format datetime string from Google Drive API."""
+    try:
+        # Parse ISO 8601 format
+        dt = datetime.datetime.fromisoformat(datetime_str.replace('Z', '+00:00'))
+        # Format in a more readable way
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return datetime_str
 
 def get_video_files_from_onedrive(folder_url):
     """
@@ -1793,7 +1925,7 @@ def is_point_in_box(point, box_coords):
 
 def batch_process_videos(video_files, output_dir, source_type, batch_size=5):
     """
-    Process videos in batches.
+    Process videos in batches with enhanced download tracking and error handling.
     
     Args:
         video_files (list): List of video files to process.
@@ -1810,29 +1942,74 @@ def batch_process_videos(video_files, output_dir, source_type, batch_size=5):
         
     print(f"Found {len(video_files)} videos to process.")
     
+    # Create directories
     temp_dir = os.path.join(output_dir, "temp_videos")
+    log_dir = os.path.join(output_dir, "logs")
     os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create download status tracking
+    download_status = {}
+    failed_downloads = []
+    
+    # Create a log file for this batch process
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"batch_process_{timestamp}.log")
+    download_log = os.path.join(log_dir, f"downloads_{timestamp}.csv")
+    
+    # Create CSV file for download stats
+    with open(download_log, 'w') as f:
+        f.write("file_name,file_id,status,size_bytes,download_time_seconds,speed_mbps,attempts,error\n")
+    
+    # Initialize logging
+    def log_message(message, also_print=True):
+        with open(log_file, 'a') as f:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{timestamp}] {message}\n")
+        if also_print:
+            print(message)
+    
+    log_message(f"Starting batch processing of {len(video_files)} videos from {source_type} source.")
     
     # Get box data and tank points from the first video
-    print("Processing first video to establish box and tank coordinates...")
+    log_message("Processing first video to establish box and tank coordinates...")
     
     first_video = video_files[0]
     first_video_path = ""
     
     try:
         if source_type == 'g':
-            success, first_video_path = download_from_google_drive(first_video['id'])
+            log_message(f"Downloading first video: {first_video['name']} (ID: {first_video['id']})")
+            success, first_video_path, stats = download_from_google_drive(first_video['id'])
+            
+            # Log download status
+            download_status[first_video['id']] = {
+                'name': first_video['name'],
+                'success': success,
+                'stats': stats
+            }
+            
             if not success:
-                print("Failed to download the first video.")
+                log_message("Failed to download the first video.", True)
+                failed_downloads.append(first_video)
                 return False
+                
             # Move to temp directory
             new_path = os.path.join(temp_dir, os.path.basename(first_video_path))
             shutil.move(first_video_path, new_path)
             first_video_path = new_path
-            print(f"Successfully downloaded: {os.path.basename(first_video_path)}")
+            log_message(f"Successfully downloaded: {os.path.basename(first_video_path)}")
+            
+            # Log download stats to CSV
+            with open(download_log, 'a') as f:
+                f.write(f"{first_video['name']},{first_video['id']},success,{stats.get('final_size', 0)},"
+                        f"{time.time() - stats.get('start_time', time.time())},{stats.get('download_speed', 0)},"
+                        f"{stats.get('attempts', 1)},{stats.get('error', '')}\n")
+                
         elif source_type == 'o':
             first_video_path = os.path.join(temp_dir, first_video['name'])
             if not download_from_onedrive(first_video['url'], first_video_path):
+                log_message("Failed to download the first video from OneDrive.", True)
                 return False
         else:  # internal
             first_video_path = first_video['path']
@@ -1842,7 +2019,7 @@ def batch_process_videos(video_files, output_dir, source_type, batch_size=5):
         box_data, tank_points = process_video(first_video_path, output_dir, enable_visualization=enable_visualization)
         
         if box_data is None or tank_points is None:
-            print("Failed to process the first video. Aborting batch processing.")
+            log_message("Failed to process the first video. Aborting batch processing.", True)
             return False
         
         # Save box data and tank points for future reference
@@ -1851,65 +2028,120 @@ def batch_process_videos(video_files, output_dir, source_type, batch_size=5):
         with open(config_file, 'w') as f:
             json.dump(config_data, f)
         
+        log_message(f"Created configuration file: {config_file}")
+        
         # Clean up the first video if it was downloaded
         if source_type in ['g', 'o']:
             os.remove(first_video_path)
+            log_message(f"Removed temporary file: {first_video_path}")
         
-        # Process the remaining videos in batches of exactly 5 (or fewer for the last batch)
+        # Process the remaining videos in batches
         remaining_videos = video_files[1:]
         total_batches = (len(remaining_videos) + batch_size - 1) // batch_size
         
         for batch_idx in range(total_batches):
-            print(f"\nProcessing batch {batch_idx + 1} of {total_batches}...")
+            log_message(f"\nProcessing batch {batch_idx + 1} of {total_batches}...")
             batch_start = batch_idx * batch_size
             batch_end = min(batch_start + batch_size, len(remaining_videos))
             batch_videos = remaining_videos[batch_start:batch_end]
             
-            print(f"Downloading {len(batch_videos)} videos for this batch...")
+            log_message(f"Downloading {len(batch_videos)} videos for this batch...")
             
             # Download batch videos if needed
             batch_video_paths = []
             for video in batch_videos:
                 if source_type == 'g':
-                    print(f"Downloading: {video['name']}...")
-                    success, video_path = download_from_google_drive(video['id'])
+                    log_message(f"Downloading: {video['name']} (ID: {video['id']})...")
+                    success, video_path, stats = download_from_google_drive(video['id'])
+                    
+                    # Log download status
+                    download_status[video['id']] = {
+                        'name': video['name'],
+                        'success': success,
+                        'stats': stats
+                    }
+                    
+                    # Log download stats to CSV
+                    with open(download_log, 'a') as f:
+                        download_time = stats.get('download_time', time.time() - stats.get('start_time', time.time()))
+                        f.write(f"{video['name']},{video['id']},{['failed', 'success'][success]},"
+                                f"{stats.get('final_size', 0)},{download_time},{stats.get('download_speed', 0)},"
+                                f"{stats.get('attempts', 1)},\"{stats.get('error', '')}\"\n")
+                    
                     if success:
                         # Move to temp directory
                         new_path = os.path.join(temp_dir, os.path.basename(video_path))
                         shutil.move(video_path, new_path)
                         batch_video_paths.append(new_path)
-                        print(f"Successfully downloaded: {os.path.basename(new_path)}")
+                        log_message(f"Successfully downloaded: {os.path.basename(new_path)}")
                     else:
-                        print(f"Failed to download: {video['name']}")
+                        log_message(f"Failed to download: {video['name']}")
+                        failed_downloads.append(video)
+                        
                 elif source_type == 'o':
                     video_path = os.path.join(temp_dir, video['name'])
                     if download_from_onedrive(video['url'], video_path):
                         batch_video_paths.append(video_path)
+                    else:
+                        log_message(f"Failed to download: {video['name']} from OneDrive")
                 else:  # internal
                     batch_video_paths.append(video['path'])
             
-            # Process each video in the batch
-            for video_path in batch_video_paths:
-                print(f"Processing: {os.path.basename(video_path)}...")
-                process_video(video_path, output_dir, box_data, tank_points, enable_visualization=False)
+            # Process the successfully downloaded videos in this batch
+            if batch_video_paths:
+                log_message(f"Processing {len(batch_video_paths)} successfully downloaded videos...")
                 
-                # Clean up downloaded videos immediately after processing
-                if source_type in ['g', 'o'] and os.path.exists(video_path):
-                    os.remove(video_path)
-                    print(f"Removed temporary file: {os.path.basename(video_path)}")
+                for video_path in batch_video_paths:
+                    log_message(f"Processing video: {os.path.basename(video_path)}")
+                    
+                    try:
+                        # Process the video with the box data and tank points from the first video
+                        success, _ = process_video(video_path, output_dir, box_data=box_data, tank_points=tank_points)
+                        
+                        if success:
+                            log_message(f"Successfully processed: {os.path.basename(video_path)}")
+                        else:
+                            log_message(f"Failed to process: {os.path.basename(video_path)}")
+                    except Exception as e:
+                        log_message(f"Error processing {os.path.basename(video_path)}: {str(e)}")
+                    
+                    # Clean up the video file
+                    if source_type in ['g', 'o'] and os.path.exists(video_path):
+                        os.remove(video_path)
+                        log_message(f"Removed temporary file: {video_path}")
+            else:
+                log_message("No videos were successfully downloaded in this batch.")
+        
+        # Summarize download results
+        log_message("\nDownload Summary:")
+        log_message(f"Total files: {len(video_files)}")
+        log_message(f"Successfully downloaded: {len(video_files) - len(failed_downloads)}")
+        log_message(f"Failed downloads: {len(failed_downloads)}")
+        
+        if failed_downloads:
+            log_message("\nFailed Downloads:")
+            for video in failed_downloads:
+                error = download_status.get(video['id'], {}).get('stats', {}).get('error', 'Unknown error')
+                log_message(f"- {video['name']} (ID: {video['id']}): {error}")
             
-            print(f"Completed batch {batch_idx + 1} of {total_batches}")
-    
+            # Save failed downloads to a file for potential retry
+            failed_file = os.path.join(log_dir, f"failed_downloads_{timestamp}.json")
+            with open(failed_file, 'w') as f:
+                json.dump(failed_downloads, f, indent=2)
+            log_message(f"Failed downloads saved to: {failed_file}")
+            
+            # Ask if user wants to retry failed downloads
+            if len(failed_downloads) > 0:
+                retry = input("\nDo you want to retry failed downloads? (y/n): ").strip().lower() == 'y'
+                if retry:
+                    log_message("Retrying failed downloads...")
+                    return batch_process_videos(failed_downloads, output_dir, source_type, batch_size)
+        
+        return True
     except Exception as e:
-        print(f"Error during batch processing: {e}")
+        log_message(f"Error in batch processing: {str(e)}", True)
+        traceback.print_exc()
         return False
-    finally:
-        # Clean up temp directory
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-            print("Cleaned up temporary directory")
-    
-    return True
 
 def extract_id_from_drive_link(link):
     """
