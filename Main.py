@@ -2153,12 +2153,39 @@ def extract_id_from_drive_link(link):
     Returns:
         str: The extracted ID or None if not found
     """
-    # Pattern for folder links
-    folder_pattern = r'(?:https?://drive\.google\.com/(?:drive/folders/|file/d/|open\?id=))([a-zA-Z0-9_-]+)'
+    # Patterns for various Google Drive URL formats
+    patterns = [
+        # Standard formats
+        r'(?:https?://drive\.google\.com/(?:drive/folders/|file/d/|open\?id=))([a-zA-Z0-9_-]+)',
+        # User-specific or shared links
+        r'(?:https?://drive\.google\.com/drive/u/\d+/folders/)([a-zA-Z0-9_-]+)',
+        # File with view parameter
+        r'(?:https?://drive\.google\.com/file/d/)([a-zA-Z0-9_-]+)(?:/view)',
+        # Shared links formats
+        r'(?:https?://drive\.google\.com/drive/shared-with-me/)([a-zA-Z0-9_-]+)',
+        # Direct share link
+        r'(?:https?://drive\.google\.com/drive/)([a-zA-Z0-9_-]+)',
+        # Just the ID itself (for cases where user might paste just the ID)
+        r'^([a-zA-Z0-9_-]{28,})$'
+    ]
     
-    match = re.search(folder_pattern, link)
-    if match:
-        return match.group(1)
+    for pattern in patterns:
+        match = re.search(pattern, link)
+        if match:
+            return match.group(1)
+    
+    # For shared links that include parameters
+    if 'id=' in link:
+        param_match = re.search(r'id=([a-zA-Z0-9_-]+)', link)
+        if param_match:
+            return param_match.group(1)
+    
+    print(f"Could not extract ID from link: {link}")
+    print("Valid formats include:")
+    print("- https://drive.google.com/drive/folders/FOLDER_ID")
+    print("- https://drive.google.com/file/d/FILE_ID")
+    print("- https://drive.google.com/file/d/FILE_ID/view")
+    print("- https://drive.google.com/drive/u/0/folders/FOLDER_ID")
     
     return None
 
