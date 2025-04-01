@@ -1592,6 +1592,9 @@ def analyze_processed_data(output_dir):
         print("No processed video data found.")
         return
 
+    # Store accuracy data for all videos
+    accuracy_data = []
+    
     for video_dir in video_dirs:
         video_path = os.path.join(output_dir, video_dir)
         video_name = video_dir
@@ -1602,7 +1605,7 @@ def analyze_processed_data(output_dir):
         summary_file = os.path.join(video_path, "summary_statistics.csv")
         visits_file = os.path.join(video_path, "box_visits.csv")
         crossings_file = os.path.join(video_path, "box_crossings.csv")
-        crossings_matrix_file = os.path.join(video_path, "box_crossings_matrix.csv")  # New matrix file
+        crossings_matrix_file = os.path.join(video_path, "box_crossings_matrix.csv")
         
         # Find required files
         fish_data_file = None
@@ -1656,7 +1659,18 @@ def analyze_processed_data(output_dir):
             total_time = np.sum(time_spent)
             total_distance = np.sum(distance)
         
+        # Calculate accuracy percentage based on total time
+        # Assuming ideal tracking time is 300 seconds (5 minutes)
+        accuracy_percentage = math.ceil((total_time / 300) * 100)
+        
         mean_speed_overall = total_distance / total_time if total_time > 0 else 0
+        
+        # Store accuracy information for later reporting
+        accuracy_data.append({
+            'video_name': video_name,
+            'total_time': total_time,
+            'accuracy_percentage': accuracy_percentage
+        })
         
         # Process box positions
         left_box = None
@@ -1844,6 +1858,7 @@ def analyze_processed_data(output_dir):
             ["metric", "value"],
             ["video_name", video_name],
             ["cumulative_time_spent_total", total_time],
+            ["accuracy_percentage", accuracy_percentage],  # Add the accuracy percentage
             ["cumulative_time_spent_left_box", box_data.get(left_box, {}).get("time_spent", 0) if left_box else 0],
             ["cumulative_time_spent_right_box", box_data.get(right_box, {}).get("time_spent", 0) if right_box else 0],
             ["cumulative_time_spent_central_region", box_data.get(central_box, {}).get("time_spent", 0) if central_box else 0],
@@ -1887,7 +1902,41 @@ def analyze_processed_data(output_dir):
         print(f"  - {crossings_file}")
         print(f"  - {crossings_matrix_file}")  # Add this line
 
-    print("All video analysis complete!")
+    # Print accuracy report after processing all videos
+    print("\n===== VIDEO TRACKING ACCURACY REPORT =====")
+    print(f"{'Video Name':<40} {'Total Time (s)':<15} {'Accuracy %':<10} {'Status'}")
+    print("=" * 80)
+    
+    # Sort by accuracy percentage (descending)
+    accuracy_data.sort(key=lambda x: x['accuracy_percentage'], reverse=True)
+    
+    high_accuracy_videos = []
+    low_accuracy_videos = []
+    
+    for video in accuracy_data:
+        # Format status based on accuracy threshold
+        if video['accuracy_percentage'] >= 90:
+            status = "GOOD"
+            high_accuracy_videos.append(video['video_name'])
+        else:
+            status = "NEEDS ATTENTION"
+            low_accuracy_videos.append(video['video_name'])
+        
+        # Print row with appropriate formatting
+        print(f"{video['video_name']:<40} {video['total_time']:<15.2f} {video['accuracy_percentage']:<10} {status}")
+    
+    print("\n===== HIGH ACCURACY VIDEOS (≥90%) =====")
+    for video in high_accuracy_videos:
+        print(f"- {video}")
+    
+    print("\n===== VIDEOS REQUIRING ATTENTION (<90%) =====")
+    if low_accuracy_videos:
+        for video in low_accuracy_videos:
+            print(f"- {video}")
+    else:
+        print("All videos have good accuracy!")
+    
+    print("\nAll video analysis complete!")
 
 def is_point_in_box(point, box_coords):
     """
