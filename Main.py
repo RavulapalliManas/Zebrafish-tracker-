@@ -42,7 +42,7 @@ FISH_ASPECT_RATIO_RANGE = (0.3, 3.0)  # Expected fish shape ratio
 MOVEMENT_THRESHOLD = 3  # Lower movement threshold (from 5)
 HISTORY_LENGTH = 10  # Frames to keep in motion history
 
-def download_from_google_drive(file_id, destination=None, max_retries=3, timeout=300):
+def download_from_google_drive(file_id, destination=None, max_retries=3):
     """
     Download a file from Google Drive with improved progress tracking and error handling.
     
@@ -51,7 +51,6 @@ def download_from_google_drive(file_id, destination=None, max_retries=3, timeout
         destination (str, optional): The path where the file will be saved.
                                     If None, will use the original filename.
         max_retries (int, optional): Maximum number of retry attempts. Defaults to 3.
-        timeout (int, optional): Timeout in seconds for the download attempt. Defaults to 300.
     
     Returns:
         tuple: (bool, str, dict) - Success status, the path where the file was saved, and download stats.
@@ -107,23 +106,31 @@ def download_from_google_drive(file_id, destination=None, max_retries=3, timeout
             file_handle = io.BytesIO()
             downloader = MediaIoBaseDownload(file_handle, request)
             
+            # Initialize the progress bar
+            pbar = tqdm(total=file_size, unit='B', unit_scale=True, desc=original_filename)
+            
             # Download the file with progress tracking
             done = False
             last_progress = 0
             while not done:
-                status, done = downloader.next_chunk(timeout=timeout)
+                status, done = downloader.next_chunk()
                 progress = int(status.progress() * 100)
+                
+                # Update the progress bar
+                downloaded_size = file_size * status.progress()
+                pbar.update(downloaded_size - pbar.n)  # Update progress bar with the new downloaded size
                 
                 # Only print if progress has changed significantly to avoid console spam
                 if progress >= last_progress + 5 or progress == 100:
                     elapsed_time = time.time() - start_time
-                    downloaded_size = file_size * status.progress()
                     speed = downloaded_size / (1024 * 1024 * elapsed_time) if elapsed_time > 0 else 0
                     eta = (file_size - downloaded_size) / (speed * 1024 * 1024) if speed > 0 else 0
                     
                     print(f"Download progress: {progress}% - {downloaded_size/(1024*1024):.2f} MB / {file_size/(1024*1024):.2f} MB "
                           f"(Speed: {speed:.2f} MB/s, ETA: {eta:.1f} seconds)")
                     last_progress = progress
+            
+            pbar.close()  # Close the progress bar
             
             # Calculate final download stats
             total_time = time.time() - start_time
