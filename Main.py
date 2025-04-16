@@ -1932,18 +1932,17 @@ def analyze_processed_data(output_dir):
         # Print row with appropriate formatting
         print(f"{video['video_name']:<40} {video['total_time']:<15.2f} {video['accuracy_percentage']:<10} {status}")
     
-    print("\n===== HIGH ACCURACY VIDEOS (≥90%) =====")
-    for video in high_accuracy_videos:
-        print(f"- {video}")
-    
-    print("\n===== VIDEOS REQUIRING ATTENTION (<90%) =====")
-    if low_accuracy_videos:
+    # Save high accuracy and low accuracy videos to a text file
+    with open(os.path.join(output_dir, "video_accuracy_summary.txt"), 'w') as summary_file:
+        summary_file.write("High Accuracy Videos (≥90%):\n")
+        for video in high_accuracy_videos:
+            summary_file.write(f"- {video}\n")
+        
+        summary_file.write("\nVideos Needing Attention (<90%):\n")
         for video in low_accuracy_videos:
-            print(f"- {video}")
-    else:
-        print("All videos have good accuracy!")
+            summary_file.write(f"- {video}\n")
     
-    print("\nAll video analysis complete!")
+    print("\nVideo accuracy summary saved to 'video_accuracy_summary.txt'.")
 
 def is_point_in_box(point, box_coords):
     """
